@@ -1,36 +1,40 @@
-# LLD: CodeBridge Agent Harness (Jira + GitHub Event Loop)
+# LLD: Agent Harness (Jira + GitHub)
 
-Implements `docs/PRD-agent-harness.md`. Read `docs/design.md` and `docs/requirements.md`
-first — this extends, not replaces, the existing GitHub polling architecture in
-`src/github-poll.ts`, `src/run-service.ts`, `src/storage.ts`.
+Implements `docs/PRD-agent-harness.md`. Read `docs/design.md` and
+`docs/requirements.md` first. This extends the GitHub polling flow in
+`src/github-poll.ts`, `src/run-service.ts`, and `src/storage.ts`. It does not
+replace it.
 
-## 1. Module map
+## 1. Modules
 
-New modules (mirror existing naming):
-
-```
-src/jira-auth.ts        # Jira client construction (API token auth), tenant-scoped
-src/jira-poll.ts        # Jira polling loop, mirrors github-poll.ts structure
-src/jira-types.ts        # Jira REST response shapes we actually consume
-src/session-links.ts     # session_link CRUD + resolution (the cross-ref core, R3)
-src/opencode-session.ts  # opencode adapter: create/resume/append-turn/get-share-url
-src/harness.ts           # top-level orchestrator wiring poll events -> session-links -> opencode
-```
-
-Modified:
+New:
 
 ```
-src/github-poll.ts   # add PR-assignee trigger (R2), route through harness.ts instead
-                      # of run-service.ts directly for linked events
-src/storage.ts        # add session_link table + jira poll high-water mark table
-src/config.ts / types.ts  # tenant.jira config block, tenant.harness.mirrorReplies
-src/index.ts           # bootstrap jira-poll alongside github-poll
+src/jira-auth.ts         # Jira client (API token), per tenant
+src/jira-poll.ts         # Jira poll loop, same shape as github-poll.ts
+src/jira-types.ts        # Jira REST response types we use
+src/session-links.ts     # session_link CRUD and resolution (PRD R3)
+src/opencode-session.ts  # opencode adapter: create, append turn, status, share URL
+src/harness.ts           # routes poll events -> session-links -> opencode
 ```
 
-## 2. Data model (storage.ts)
+Changed:
 
-Two new tables (SQLite dev / Postgres prod — reuse existing `storage.ts` dual-driver
-pattern, do not add a second DB library).
+```
+src/github-poll.ts             # PR-assignee trigger (R2); send linked events to harness.ts
+src/storage.ts                 # session_link + jira_poll_state methods
+sql/schema.sql                 # new tables (Postgres)
+sql/schema.sqlite.sql          # new tables (SQLite)
+src/config.ts, src/types.ts    # tenant.jira, tenant.opencode, tenant.harness
+src/index.ts                   # start jira-poll next to github-poll
+```
+
+Schema lives in `sql/*.sql`, not in `storage.ts`. SQLite column changes also
+need an entry in `ensureSqliteRunSchemaMigrations`.
+
+## 2. Data model
+
+Same two drivers as today (SQLite for dev, Postgres for prod). No new DB library.
 
 ```sql
 CREATE TABLE session_link (
@@ -46,22 +50,21 @@ CREATE TABLE session_link (
   updated_at            TEXT NOT NULL,
   UNIQUE (tenant_id, opencode_session_id)
 );
-CREATE INDEX idx_session_link_jira   ON session_link (tenant_id, jira_issue_key);
-CREATE INDEX idx_session_link_ghiss  ON session_link (tenant_id, github_repo, github_issue_number);
-CREATE INDEX idx_session_link_ghpr   ON session_link (tenant_id, github_repo, github_pr_number);
+CREATE INDEX idx_session_link_jira  ON session_link (tenant_id, jira_issue_key);
+CREATE INDEX idx_session_link_ghiss ON session_link (tenant_id, github_repo, github_issue_number);
+CREATE INDEX idx_session_link_ghpr  ON session_link (tenant_id, github_repo, github_pr_number);
 
 CREATE TABLE jira_poll_state (
-  tenant_id      TEXT PRIMARY KEY,
-  last_cursor    TEXT NOT NULL,   -- Jira `updated` JQL cursor (ISO timestamp) or nextPageToken
-  updated_at     TEXT NOT NULL
+  tenant_id    TEXT PRIMARY KEY,
+  last_cursor  TEXT NOT NULL,   -- `updated` timestamp of the newest issue seen
+  updated_at   TEXT NOT NULL
 );
 ```
 
-Note the `UNIQUE (tenant_id, opencode_session_id)` constraint is what enforces
-PRD AC5 (no two rows share a session) at the DB layer, not just app logic —
-required, not optional, because two poll loops (Jira + GitHub) can race.
+`UNIQUE (tenant_id, opencode_session_id)` enforces AC5 in the database. It is
+required: the Jira and GitHub loops can race.
 
-## 3. `session-links.ts` — resolution algorithm (implements PRD R3)
+## 3. `session-links.ts` (PRD R3)
 
 ```ts
 type LinkKey =
@@ -70,54 +73,50 @@ type LinkKey =
   | { kind: "gh_pr"; repo: string; number: number }
 
 export async function resolveLink(store, tenantId: string, keys: LinkKey[]): Promise<SessionLink | null>
-// Query session_link where ANY of the provided keys match. If keys resolve to
-// MORE THAN ONE distinct row, this is a conflict (two previously-separate threads
-// now claim to be the same work) -- see section 3.1, do not silently pick one.
+// Finds rows matching ANY key. If keys match more than one row, that is a
+// conflict (see 3.1). Never pick one silently.
 
 export async function attachIdentifier(store, linkId: string, key: LinkKey): Promise<void>
-// Sets the corresponding column IF NULL. If the column is already set to a
-// DIFFERENT value, throws SessionLinkConflictError -- caller must surface this
-// as a bot comment ("this PR looks linked to two different tickets") rather than
-// overwrite (PRD R3 "fail loudly, not silently overwrite").
+// Sets the column if it is NULL. If it holds a different value, throws
+// SessionLinkConflictError. The caller posts a bot comment
+// ("this PR looks linked to two different tickets"). Never overwrite.
 
 export async function createLink(store, tenantId, initialKey: LinkKey, opencodeSessionId: string): Promise<SessionLink>
 ```
 
-Precedence for building the `LinkKey[]` candidate list before calling `resolveLink`
-(implements PRD R3 precedence order 1-4):
+Building the candidate `LinkKey[]` before `resolveLink`:
 
-1. Explicit hint parsed from the triggering comment/ticket body
-   (`gh:<owner/repo>#123`, `jira:<KEY>`, a GitHub PR/issue URL, or a Jira browse
-   URL) — reuse `commands.ts`'s existing hint-parsing patterns, extend rather than
-   duplicate.
-2. Convention-derived keys: PR body `Closes/Fixes/Resolves #N`; branch name regex
-   `[A-Z]+-\d+` matched as a Jira key.
-3. If a `session_link` already contains ANY of the triggering event's own
-   identifiers (e.g. this is the 2nd comment on a PR whose link row already
-   exists), that row wins regardless of new hints found in step 1/2 UNLESS the new
-   hint conflicts (see 3.1).
+1. **Explicit hint** in the comment or ticket: `gh:<owner/repo>#123`,
+   `jira:<KEY>`, a GitHub PR/issue URL, or a Jira browse URL.
+   `commands.ts` already parses `tenant:<id>`, `owner/repo#N`, and `#N`.
+   Extend it for `jira:` and `gh:`; do not write a second parser.
+2. **Convention:** `Closes/Fixes/Resolves #N` in the PR body. Branch names
+   matching `[A-Z]+-\d+` count as Jira keys.
+3. **Existing row:** if a row already holds one of the event's own identifiers
+   (for example, the second comment on a linked PR), that row wins over new
+   hints from steps 1–2, unless they conflict (3.1).
 
-### 3.1 Conflict handling
+### 3.1 Conflicts
 
-If `resolveLink` finds keys pointing at two different existing rows (e.g. a PR
-already linked to ticket A, but its body now says `Closes #999` which belongs to a
-row linked to ticket B): do NOT merge automatically. Post one bot comment on the
-triggering surface naming both linked ids and stop routing until a human/agent
-explicitly resolves it (mirrors the "escalate ambiguous state" posture already used
-for tenant-resolution failures in `docs/design.md`). Log at `warn`.
+Example: a PR is linked to ticket A, and its body now says `Closes #999`, which
+belongs to a row for ticket B.
 
-## 4. `opencode-session.ts` — adapter contract
+- Do not merge.
+- Post one bot comment on the triggering surface naming both links.
+- Stop routing for that surface until someone resolves it.
+- Log at `warn`.
 
-v1 target mode (per PRD open question default): a local `opencode serve` HTTP API
-process per tenant (or one shared instance handling multiple sessions — prefer
-one shared instance keyed by session id, simpler ops). CodeBridge does NOT spawn a
-new `opencode` process per session; it creates/resumes SESSIONS against one running
-server.
+This matches how `docs/design.md` handles failed tenant resolution.
+
+## 4. `opencode-session.ts` (adapter)
+
+v1 talks to one shared `opencode serve` process over HTTP. It creates and
+resumes sessions on that server. It does not spawn one `opencode` per session.
 
 ```ts
 export interface OpencodeSession {
   sessionId: string
-  shareUrl: string | null   // null if opencode instance has no configured public/share base URL
+  shareUrl: string | null   // null when sharing is off
 }
 
 export async function createSession(params: {
@@ -130,34 +129,45 @@ export async function appendTurn(sessionId: string, prompt: string): Promise<{ r
 export async function getSessionStatus(sessionId: string): Promise<"running" | "idle" | "completed" | "not_found">
 ```
 
-Config: `tenant.opencode.baseUrl` (default `http://127.0.0.1:4096`, opencode's
-default serve port), `tenant.opencode.shareBaseUrl` (optional, used to build
-`shareUrl` for humans; if unset, `shareUrl` is null and the harness falls back to
-posting the raw session id + local resume command instead of a URL).
+opencode server endpoints this maps to (from opencode.ai/docs/server; verify
+against the installed version):
 
-Failure handling: opencode server unreachable must be treated exactly like a
-Codex runner failure in the existing code — post an actionable error comment,
-mark the run/link `idle`, never crash the poll loop (PRD AC7 pattern extended to
-opencode as a third external dependency).
+| Adapter call | Endpoint |
+|---|---|
+| `createSession` | `POST /session` (body: `{ parentID?, title? }`) |
+| `appendTurn` | `POST /session/:id/message` (waits) or `POST /session/:id/prompt_async` |
+| `getSessionStatus` | `GET /session/status` |
+| share URL | `POST /session/:id/share` |
 
-## 5. `jira-poll.ts` — polling loop (implements PRD R1)
+`POST /session` has no repo/directory field. How a session is bound to
+`repoPath` is still open (see §9).
 
-Structure directly mirrors `github-poll.ts`'s `startGitHubPolling`:
+Config:
+
+- `tenant.opencode.baseUrl`: default `http://127.0.0.1:4096` (opencode's default).
+- `tenant.opencode.shareBaseUrl`: optional. If unset, `shareUrl` is null and the
+  harness posts the session id and a local resume command instead.
+
+Failures: if the opencode server is down, treat it like a Codex runner failure.
+Post an actionable error comment, set the link to `idle`, keep polling.
+
+## 5. `jira-poll.ts` (PRD R1)
+
+Same structure as `startGitHubPolling`:
 
 ```ts
 export function startJiraPolling(params: {
   config: AppConfig
   store: RunStore
-  harness: Harness          // see section 6
+  harness: Harness          // see §6
   env: JiraPollEnv
 }) {
-  // same `running` re-entrancy guard, same per-tenant isolation (try/catch per
-  // tenant so one tenant's Jira outage doesn't stop others), same min-interval
-  // floor (10s) as github-poll.ts.
+  // Same `running` re-entrancy guard, same per-tenant try/catch,
+  // same 10s minimum interval as github-poll.ts.
 }
 ```
 
-Jira query per tick, per tenant with `tenant.jira` configured:
+Query per tick, for each tenant with `tenant.jira`:
 
 ```
 GET /rest/api/3/search/jql
@@ -165,58 +175,58 @@ GET /rest/api/3/search/jql
   fields: assignee,comment,status,summary
 ```
 
-- Advance `lastCursor` to the max `fields.updated` seen, persisted to
-  `jira_poll_state` after each successful tick (same "high-water mark" pattern as
-  GitHub poll state in `storage.ts`).
-- For each returned issue:
-  - if `fields.assignee.accountId === tenant.jira.agentAccountId` AND no existing
-    `session_link` for this Jira key → bootstrap event (R1 issue.assigned).
-  - for each comment newer than the last time we processed this issue (track
-    per-issue last-seen comment id/timestamp, can reuse the same `jira_poll_state`
-    row keyed finer, or a second small table if per-issue tracking is needed —
-    prefer per-issue tracking with a `jira_seen_comment` table if comment volume
-    per tick can be >1 per issue) AND not authored by the bot's own Jira account →
-    comment event (R1 comment.created).
-- Auth: `Authorization: Basic base64(email:apiToken)` built once per tenant, cached
-  (no token TTL/refresh needed for API tokens, unlike GitHub App installation
-  tokens — simpler than `github-poll.ts`'s client cache).
+- After each successful tick, set `lastCursor` to the newest `fields.updated`
+  seen and save it to `jira_poll_state`.
+- For each issue:
+  - **Bootstrap:** `fields.assignee.accountId === tenant.jira.agentAccountId`
+    and no link row for the key.
+  - **Comment:** a comment newer than the last one processed for this issue and
+    not written by the agent account. Track the last seen comment per issue.
+    Use a `jira_seen_comment` table if an issue can get more than one comment
+    per tick.
+- Auth header: `Basic base64(email:apiToken)`, built once per tenant. API tokens
+  do not expire like GitHub installation tokens, so no refresh cache.
 
-## 6. `harness.ts` — orchestrator (ties R1-R6 together)
+## 6. `harness.ts` (orchestrator)
 
-Single entry point both pollers call instead of talking to `run-service.ts`
-directly, so link-resolution logic lives in ONE place:
+Both pollers call the harness instead of `run-service.ts`. All linking and
+session logic lives here.
 
 ```ts
 export async function handleAssignmentEvent(ctx: HarnessCtx, ev: AssignmentEvent): Promise<void>
 // ev: { source: "jira" | "github_pr" | "github_issue", tenantId, keys: LinkKey[], repoPath, title }
-// 1. candidateKeys = buildCandidateKeys(ev)   // section 3 precedence
+// 1. candidateKeys = buildCandidateKeys(ev)          // §3 order
 // 2. existing = await resolveLink(store, tenantId, candidateKeys)
-// 3. if existing && existing.status !== 'completed': reuse its session (idempotent
-//    re-assignment, e.g. Jira fires assigned twice) -- do NOT create a second session.
-// 4. if existing && existing.status === 'completed' && withinReactivationWindow:
-//    resume same opencode session id (R4), set status back to 'active'.
-// 5. else: create opencode session, createLink(...), post share link/id back to
-//    ev.source (and mirror per tenant.harness.mirrorReplies).
+// 3. existing and not completed: reuse its session. Re-assignment is a no-op.
+// 4. existing, completed, inside reactivation window: resume the same
+//    session id, set status 'active'.
+// 5. otherwise: create a session, createLink(...), post the share link to
+//    ev.source (and to other surfaces per mirrorReplies).
 
 export async function handleCommentEvent(ctx: HarnessCtx, ev: CommentEvent): Promise<void>
 // ev: { source, tenantId, keys: LinkKey[], commentBody, authorIsBot }
-// 1. if ev.authorIsBot: return (dedupe, R5)
+// 1. authorIsBot: return.
 // 2. link = await resolveLink(store, tenantId, ev.keys)
-// 3. if !link: treat as a fresh bootstrap only if the comment carries an explicit
-//    mention/prefix (same "unmanaged issue needs a mention" rule as existing
-//    GitHub logic) -- else ignore.
+// 3. no link: bootstrap only if the comment mentions the agent, else ignore
+//    (same rule as unmanaged GitHub issues today).
 // 4. { reply } = await appendTurn(link.opencodeSessionId, ev.commentBody)
-// 5. post `reply` back to ev.source always; to other linked surfaces only if
-//    tenant.harness.mirrorReplies === 'all'.
-// 6. update session_link.updated_at, status='active'.
+// 5. post reply to ev.source; to other linked surfaces only if mirrorReplies === 'all'.
+// 6. set updated_at, status = 'active'.
 ```
 
-`github-poll.ts` and `jira-poll.ts` become thin event producers; all cross-linking
-and session lifecycle logic is centralized in `harness.ts` — this is the piece that
-directly satisfies the PRD's core ask ("keep track of jira-github issue-github pr
-references to address comments ... into one opencode session").
+`github-poll.ts` and `jira-poll.ts` only produce events.
 
-## 7. Config schema additions (`config.ts`, `types.ts`, `config/tenants.yaml`)
+### GitHub poller changes this needs
+
+- `pollAssignedIssues` skips PRs today (`if (issue.pull_request) continue`).
+  Remove that for the PR trigger.
+- The comment loop drops loose follow-ups on issues without `agent:managed`.
+  A linked PR or issue must count as managed even without the label.
+- The comment loop reads `issues.listCommentsForRepo` only. That covers PR
+  conversation comments, not inline review comments. AC3 needs review
+  comments, so add a `pulls.listReviewCommentsForRepo` pass.
+
+## 7. Config
 
 ```yaml
 tenants:
@@ -226,9 +236,7 @@ tenants:
     jira:
       baseUrl: "https://yourorg.atlassian.net"
       projectKey: "PROJ"
-      agentAccountId: "712020:xxxx-xxxx"   # the bot/agent Jira account
-      email: "${JIRA_EMAIL}"
-      apiToken: "${JIRA_API_TOKEN}"
+      agentAccountId: "712020:xxxx-xxxx"   # the agent's Jira account
       pollIntervalSec: 30
     opencode:
       baseUrl: "http://127.0.0.1:4096"
@@ -238,44 +246,40 @@ tenants:
       reactivationWindowMinutes: 60
 ```
 
-Validate with the existing `zod` schemas in `config.ts`; Jira block optional (a
-tenant with no `jira` key simply never gets a Jira poller — same opt-in pattern as
-current optional Slack/mirror blocks).
+- Validate with the `zod` schemas in `config.ts`.
+- `jira` is optional. No `jira` block means no Jira poller, like the optional
+  `slack` block.
+- Credentials: `config.ts` does not expand `${VAR}` in YAML. Read
+  `JIRA_EMAIL` and `JIRA_API_TOKEN` from env in `loadEnv()`, or add them to the
+  `secrets` block. Never put them in the tenants file in git.
 
-## 8. Sequencing / rollout plan (issue breakdown for the kanban board)
+## 8. Build order
 
-1. **Storage migration**: `session_link` + `jira_poll_state` tables, both DB
-   drivers, migration tests.
-2. **`session-links.ts`**: resolution + attach + conflict handling, unit tests
-   covering PRD AC5 and the 3.1 conflict path.
-3. **`opencode-session.ts`** adapter against a real local `opencode serve`
-   instance (integration test spins one up, or documents why it's mocked with a
-   fake HTTP server — never mock the thing under test per project mock-test rules
-   in `docs/testing.md`; this adapter's OWN tests may run against a real local
-   opencode process since that's fully within test control, not a third-party
-   dependency like OAuth).
-4. **`jira-poll.ts`**: polling loop + Jira API client, against a fixture/mock Jira
-   server for unit tests (Jira Cloud itself is out of local test control, same
-   reasoning as why `google-workspace.test.js` needs real creds but general unit
-   tests use fixtures).
-5. **`harness.ts`**: orchestrator wiring 2+3+4 together; this is where
-   `handleAssignmentEvent`/`handleCommentEvent` get their real tests (AC1-AC4).
-6. **`github-poll.ts` PR-assignee trigger** (R2): smallest diff, add last so it can
-   route directly into the already-tested `harness.ts`.
-7. **E2E test extending `docs/test-protocol.md`**: Jira ticket assign → session
-   created → GitHub PR comment on linked PR → same session → Jira comment → same
-   session. This is the test that actually proves the PRD's core ask.
+Each step is one card and depends on the one before it.
 
-Each numbered item is one kanban card with an explicit dependency edge on the
-previous (session-links before harness before github-poll wiring).
+1. **Storage:** `session_link` and `jira_poll_state` in both schema files, store
+   methods, tests.
+2. **`session-links.ts`:** resolve, attach, conflicts. Unit tests for AC5 and §3.1.
+3. **`opencode-session.ts`:** tests against a real local `opencode serve`. It is
+   under our control, so do not mock it.
+4. **`jira-poll.ts`:** poll loop and client. Unit tests use a fake Jira server,
+   since Jira Cloud is outside local test control.
+5. **`harness.ts`:** wire 2–4. Real tests for AC1–AC4 live here.
+6. **`github-poll.ts` PR trigger (R2):** smallest change, done last so it routes
+   into a tested harness.
+7. **E2E**, added to `docs/test-protocol.md` and a `scripts/test-*.ts` runner:
+   assign Jira ticket → session created → comment on linked PR → same session
+   → Jira comment → same session. This test proves the PRD.
 
-## 9. Explicit risks / things NOT to guess
+## 9. Risks and open items
 
-- If the target opencode version does not expose a stable REST session API,
-  `opencode-session.ts`'s contract must be re-verified against the installed
-  opencode version FIRST — do not implement against assumed endpoints. This is a
-  spike task, not an assumption to bake into the schema above.
-- Jira Cloud REST v3 `/search/jql` endpoint (used above) replaced the deprecated
-  `/search` GET-with-jql-param endpoint; verify against the org's actual Jira
-  Cloud vs Server/Data Center distinction before writing the client (Server/DC
-  uses different auth and a different search endpoint shape).
+- **opencode API.** Check the installed version's `/doc` spec before writing
+  the adapter. Treat it as a spike. Do not build on assumed endpoints.
+- **Repo binding.** `POST /session` takes no directory. Decide how a session
+  gets its repo: one server per repo, a per-request directory parameter, or
+  something else.
+- **Sharing.** Confirm what `POST /session/:id/share` publishes and where,
+  before posting share links on public repos.
+- **Jira search.** `/rest/api/3/search/jql` replaced the old `/search`. It is
+  Jira Cloud only. Server/Data Center uses a different endpoint and auth.
+  Confirm which one the target site runs.
