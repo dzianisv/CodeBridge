@@ -5,6 +5,27 @@ Implements `docs/PRD-agent-harness.md`. Read `docs/design.md` and
 `src/github-poll.ts`, `src/run-service.ts`, and `src/storage.ts`. It does not
 replace it.
 
+**Prior art:** [openai/symphony](https://github.com/openai/symphony) (SPEC.md)
+solves the same class of problem — poll a tracker, dispatch an isolated agent
+session per unit of work, reconcile state. Two of its design choices are
+adopted here because they close gaps this LLD's first draft had:
+
+1. **Per-link workspace isolation.** Symphony gives every issue its own
+   workspace directory so concurrent agent runs never share a working tree.
+   Our v1 draft didn't say anything about workspace isolation between
+   sessions — §4a below fixes that.
+2. **Adapter never writes.** Symphony's tracker adapter is read/normalize
+   only; ticket comments, state transitions, and PR links are written by the
+   agent itself through provider-native tools, using credentials the
+   orchestrator hands it, not a second write path in the orchestrator. This
+   resolves an open question in the first draft (who actually posts the reply
+   comment, and with what auth) — see §6.2 below.
+
+We do not adopt Symphony's full normalized `Issue`/`dispatchable` model or its
+Elixir/OTP process supervision; those are architectural choices for a
+different runtime and out of scope for this extension of the existing
+poll-loop design in `github-poll.ts`.
+
 ## 1. Modules
 
 New:
@@ -234,6 +255,26 @@ Config:
 Failures: if the opencode server is down, treat it like a Codex runner failure.
 Post an actionable error comment, set the link to `idle`, keep polling.
 
+## 4a. Workspace isolation (Symphony-inspired)
+
+Each `session_link` gets its own workspace directory,
+`<workspaceRoot>/<tenant_id>/<link_id>/`, checked out from `repoPath` on
+first use. This is the missing half of the repo-binding question in §4:
+
+- The harness, not opencode, owns the checkout. It clones/worktrees the repo
+  into the link's workspace directory before the first `createSession` call
+  for that link, and passes that directory to whatever repo-binding mechanism
+  the opencode spike settles on (one `opencode serve` per workspace directory
+  is the leading candidate — confirm in the spike).
+- Two links for the same repo never share a workspace, even if both are
+  active at once — this is what actually prevents one session's uncommitted
+  changes from bleeding into another's.
+- Workspace directories persist across reactivation (§6) so a resumed session
+  sees its own prior branch state, not a fresh clone.
+- Cleanup: delete the workspace directory only when `status = 'completed'`
+  and past `reactivationWindowMinutes`, same lifecycle as the DB row's
+  `completed` state. Never delete a workspace for an `active`/`idle` link.
+
 ## 5. `jira-poll.ts` (PRD R1)
 
 Same structure as `startGitHubPolling`:
@@ -343,6 +384,29 @@ a second entry point that decides WHICH runner path an event takes:
   same session queue in `harness.ts` behind a per-session in-process lock
   (single instance for v1); a second harness instance is out of scope until
   the queue is externalized.
+
+### 6.2 Who writes back to Jira/GitHub (Symphony-inspired)
+
+The first draft left this implicit. Following Symphony's adapter-never-writes
+rule:
+
+- The harness does not post replies itself using a bot API token. Instead, the
+  opencode session is given the tracker credentials (a scoped Jira API token
+  and a GitHub token, per tenant) as tool access, and the agent's own reply —
+  the actual comment, status transition, or PR update — is written by the
+  agent through those tools as part of its turn.
+- `harness.ts` is responsible only for: routing the event to the right
+  session, and (only as a fallback, e.g. the opencode call itself failed) for
+  posting a bot error comment saying the run failed. It is not responsible for
+  mirroring the agent's own successful reply.
+- This changes `mirrorReplies` in config (§7): it no longer means "the harness
+  copies text between surfaces" — it means "the harness's prompt to the agent
+  instructs it to reply on the other linked surfaces too." Document this
+  distinction in the prompt template, not just the config comment.
+- Credential scoping: the tenant's Jira/GitHub tokens used by the agent must
+  be least-privilege (comment + status-transition on the linked ticket, not
+  admin/org-wide), since the token now lives inside the agent's tool-call
+  surface, not just the harness process.
 
 ### GitHub poller changes this needs
 
