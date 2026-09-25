@@ -213,3 +213,5 @@ pnpm test:vibe-agents
 - [Design](docs/design.md)
 - [GitHub Surface Test Protocol](docs/test-protocol.md)
 - [GitHub Assignee Setup](docs/github-assignee-setup.md)
+- [Agent Harness PRD (Jira + GitHub)](docs/PRD-agent-harness.md)
+- [Agent Harness LLD (Jira + GitHub)](docs/LLD-agent-harness.md)
