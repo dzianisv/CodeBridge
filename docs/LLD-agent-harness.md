@@ -40,19 +40,29 @@ Same two drivers as today (SQLite for dev, Postgres for prod). No new DB library
 CREATE TABLE session_link (
   id                    TEXT PRIMARY KEY,
   tenant_id             TEXT NOT NULL,
-  jira_issue_key        TEXT,
-  github_repo           TEXT,          -- 'owner/repo'
-  github_issue_number   INTEGER,
-  github_pr_number      INTEGER,
   opencode_session_id   TEXT NOT NULL,
   status                TEXT NOT NULL DEFAULT 'active', -- active|idle|completed
   created_at            TEXT NOT NULL,
   updated_at            TEXT NOT NULL,
-  UNIQUE (tenant_id, opencode_session_id)
+  UNIQUE (tenant_id, opencode_session_id),
+  UNIQUE (id)
 );
-CREATE INDEX idx_session_link_jira  ON session_link (tenant_id, jira_issue_key);
-CREATE INDEX idx_session_link_ghiss ON session_link (tenant_id, github_repo, github_issue_number);
-CREATE INDEX idx_session_link_ghpr  ON session_link (tenant_id, github_repo, github_pr_number);
+
+-- One row can be linked to MANY identifiers (a ticket with 3 PRs, a PR closing
+-- 2 issues). This is the fix for review finding #2 (one row could only hold
+-- one Jira key + one issue + one PR + one repo).
+CREATE TABLE session_link_key (
+  link_id    TEXT NOT NULL REFERENCES session_link(id),
+  kind       TEXT NOT NULL,   -- 'jira' | 'gh_issue' | 'gh_pr'
+  repo       TEXT,            -- 'owner/repo', null for kind='jira'
+  value      TEXT NOT NULL,   -- jira issue key, or issue/PR number as text
+  tenant_id  TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  -- This is the actual race fix (review finding #1): a given identifier can
+  -- belong to only one link, globally, enforced by the DB, not app logic.
+  UNIQUE (tenant_id, kind, repo, value)
+);
+CREATE INDEX idx_session_link_key_link ON session_link_key (link_id);
 
 CREATE TABLE jira_poll_state (
   tenant_id    TEXT PRIMARY KEY,
@@ -61,8 +71,31 @@ CREATE TABLE jira_poll_state (
 );
 ```
 
-`UNIQUE (tenant_id, opencode_session_id)` enforces AC5 in the database. It is
-required: the Jira and GitHub loops can race.
+`UNIQUE (tenant_id, opencode_session_id)` enforces AC5 (no two rows share a
+session). `UNIQUE (tenant_id, kind, repo, value)` on `session_link_key`
+enforces the actual race condition callers care about: two pollers cannot both
+insert a key row for the same Jira ticket / GitHub issue / GitHub PR, because
+the second insert fails the constraint. This replaces the old design where
+`session_link` embedded exactly one of each identifier — that could not model
+"one ticket, three PRs" and did not stop a genuine double-bootstrap race
+(review finding #1 and #2).
+
+**Creation order (claim-then-create), fixes review finding #1's second half:**
+1. Insert the `session_link_key` row for the triggering identifier FIRST,
+   inside a transaction, with a placeholder `link_id` that does not yet have a
+   `session_link` row. If the insert fails (unique violation), someone else
+   claimed this identifier — stop, look up their `link_id`, and follow the
+   existing-row path instead of creating a session.
+2. Only after the claim succeeds, call `createSession` (opencode) and then
+   insert the `session_link` row using the same `link_id`.
+3. If step 2 fails (opencode down), delete the claimed key row so a retry
+   is possible; do not leave an orphan claim.
+
+This avoids the old ordering problem: `opencode_session_id NOT NULL` meant the
+session had to exist before the row could be inserted, which left no way to
+claim an identifier atomically before paying the cost of creating a session.
+Claiming the identifier first is cheap (a DB insert) and is the actual
+concurrency guard; the session gets created once, by whichever caller wins.
 
 ## 3. `session-links.ts` (PRD R3)
 
@@ -73,15 +106,24 @@ type LinkKey =
   | { kind: "gh_pr"; repo: string; number: number }
 
 export async function resolveLink(store, tenantId: string, keys: LinkKey[]): Promise<SessionLink | null>
-// Finds rows matching ANY key. If keys match more than one row, that is a
-// conflict (see 3.1). Never pick one silently.
+// Looks up session_link_key rows matching ANY key, joins to session_link.
+// If keys match more than one DISTINCT link_id, that is a conflict (3.1).
+// Never pick one silently.
 
 export async function attachIdentifier(store, linkId: string, key: LinkKey): Promise<void>
-// Sets the column if it is NULL. If it holds a different value, throws
-// SessionLinkConflictError. The caller posts a bot comment
-// ("this PR looks linked to two different tickets"). Never overwrite.
+// Inserts a session_link_key row for (tenantId, key.kind, repo, value) with
+// this link_id. The UNIQUE constraint on session_link_key does the
+// conflict detection: if the identifier is already claimed by a different
+// link_id, the insert fails -- catch that, throw SessionLinkConflictError.
+// The caller posts a bot comment ("this PR looks linked to two different
+// tickets"). Never delete/reassign the other link's key row.
 
-export async function createLink(store, tenantId, initialKey: LinkKey, opencodeSessionId: string): Promise<SessionLink>
+export async function claimAndCreateLink(store, tenantId, initialKey: LinkKey, createSession: () => Promise<OpencodeSession>): Promise<SessionLink>
+// Implements the claim-then-create order from section 2: insert the key row
+// first (the real concurrency guard), then call createSession, then insert
+// session_link. On key-insert conflict, look up and return the existing link
+// instead of creating a new session. On createSession failure, delete the
+// claimed key row and rethrow.
 ```
 
 Building the candidate `LinkKey[]` before `resolveLink`:
@@ -95,6 +137,19 @@ Building the candidate `LinkKey[]` before `resolveLink`:
 3. **Existing row:** if a row already holds one of the event's own identifiers
    (for example, the second comment on a linked PR), that row wins over new
    hints from steps 1–2, unless they conflict (3.1).
+
+This is one fixed order (hint → convention → existing row), not the two
+different orders the first draft gave in the PRD vs this doc.
+
+### 3.2 Attaching a PR the agent opens (review finding #4)
+
+When `harness.ts` opens a PR on behalf of a linked Jira ticket, it must:
+1. Name the branch `<config.branchPrefix>/<jira-key>-<slug>` (harness picks
+   the name, not a guess after the fact).
+2. After the PR is created, call `attachIdentifier(linkId, {kind: "gh_pr", ...})`
+   immediately, in the same code path that created the PR. Do not rely on
+   polling to notice the branch-name convention later — that is a race and a
+   silent-miss risk if the convention match ever fails.
 
 ### 3.1 Conflicts
 
@@ -110,27 +165,32 @@ This matches how `docs/design.md` handles failed tenant resolution.
 
 ## 4. `opencode-session.ts` (adapter)
 
-v1 talks to one shared `opencode serve` process over HTTP. It creates and
-resumes sessions on that server. It does not spawn one `opencode` per session.
+**Everything in this section is unverified against the installed opencode
+version and must be spiked first (review findings #6, #7 — these were stated
+as fact in the first draft and were wrong or unconfirmed).**
 
 ```ts
 export interface OpencodeSession {
   sessionId: string
-  shareUrl: string | null   // null when sharing is off
+  shareUrl: string | null   // see privacy note below before ever setting this
 }
 
 export async function createSession(params: {
-  repoPath: string
   title: string             // e.g. "PROJ-123: fix flaky CI"
 }): Promise<OpencodeSession>
+// `POST /session` takes no directory/repoPath field in the documented API.
+// Spike required: confirm whether repo binding is per-server (one `opencode
+// serve` process per repo/worktree, started by the harness) or per-request.
+// Do not build session-links.ts's repoPath assumption on an unverified API.
 
 export async function appendTurn(sessionId: string, prompt: string): Promise<{ reply: string }>
+// POST /session/:id/message blocks for the whole turn (can be minutes).
+// Calling this synchronously from a poll tick stalls that tenant's poller.
+// Default to prompt_async + poll getSessionStatus, not the blocking call,
+// unless the spike shows turns are reliably short.
 
 export async function getSessionStatus(sessionId: string): Promise<"running" | "idle" | "completed" | "not_found">
 ```
-
-opencode server endpoints this maps to (from opencode.ai/docs/server; verify
-against the installed version):
 
 | Adapter call | Endpoint |
 |---|---|
@@ -139,14 +199,37 @@ against the installed version):
 | `getSessionStatus` | `GET /session/status` |
 | share URL | `POST /session/:id/share` |
 
-`POST /session` has no repo/directory field. How a session is bound to
-`repoPath` is still open (see §9).
+**Repo mapping (review finding #3):** `AssignmentEvent` needs a `repoPath`,
+but nothing maps a Jira project to a repo. `tenant.jira` config gets a
+required `repo: "owner/repo"` field (one project key -> one repo for v1;
+multi-repo projects are out of scope and must be split into separate tenant
+entries). `jira-poll.ts` sets `ev.repoPath` from this config field, not from
+guessing.
+
+**Privacy (review finding #6):** `opencode serve` binds `127.0.0.1` by
+default, so a raw session URL is not reachable by a human without a tunnel.
+`POST /session/:id/share` publishes the transcript to opencode's own hosted
+share service — a PUBLIC link, not a private one. For a private repo, sharing
+can leak code and comments. Before wiring `shareUrl` into any bot comment:
+confirm the org is fine with public share links, or drop the share feature
+and post `sessionId` + a local `opencode --resume` command instead. Do not
+ship an assumed private/local share URL — that string does not exist in the
+current opencode API.
+
+**Permissions:** the server exposes `POST /session/:id/permissions/:id` for
+approving tool-use prompts. A session running headless with no one polling
+that endpoint will stall on the first permission prompt. Decide the default
+permission mode (e.g. run opencode with `--yolo`/auto-approve equivalent) or
+build a permission-auto-approve loop into the harness; this was undefined
+in the first draft.
 
 Config:
 
 - `tenant.opencode.baseUrl`: default `http://127.0.0.1:4096` (opencode's default).
-- `tenant.opencode.shareBaseUrl`: optional. If unset, `shareUrl` is null and the
-  harness posts the session id and a local resume command instead.
+- `tenant.opencode.sharingEnabled`: default `false`. Only call `POST
+  /session/:id/share` when explicitly turned on per tenant, given the public
+  link caveat above. (Replaces the invented `shareBaseUrl` config key, which
+  is not an opencode concept.)
 
 Failures: if the opencode server is down, treat it like a Codex runner failure.
 Post an actionable error comment, set the link to `idle`, keep polling.
@@ -175,6 +258,24 @@ GET /rest/api/3/search/jql
   fields: assignee,comment,status,summary
 ```
 
+**Cursor precision and dedupe (review finding #8):** JQL `updated >=` has
+minute precision and evaluates in the searching user's Jira timezone, not
+UTC/ISO seconds. Two issues can share a minute and land on either side of a
+tick boundary. To avoid dropping one:
+- Re-query one minute of overlap on every tick (subtract 60s from `lastCursor`
+  before the query) and dedupe against `jira_seen_comment`/an
+  already-processed-issue check, rather than trusting the boundary is exact.
+- `nextPageToken` from `/search/jql` is a same-request pagination token, not a
+  cross-tick cursor. Do not reuse it as `lastCursor` between ticks — only
+  `fields.updated` is safe for that.
+
+**Comment bodies are ADF, not text (review finding #8):** Jira Cloud v3
+comment bodies are Atlassian Document Format (JSON), not plain strings.
+`appendTurn` needs plain text, and any reply posted back to Jira needs ADF.
+Add an `adfToText`/`textToAdf` pair in `jira-types.ts` (or a small vendored
+converter) as a required build item, not an afterthought — this was assumed
+away in the first draft.
+
 - After each successful tick, set `lastCursor` to the newest `fields.updated`
   seen and save it to `jira_poll_state`.
 - For each issue:
@@ -200,8 +301,9 @@ export async function handleAssignmentEvent(ctx: HarnessCtx, ev: AssignmentEvent
 // 3. existing and not completed: reuse its session. Re-assignment is a no-op.
 // 4. existing, completed, inside reactivation window: resume the same
 //    session id, set status 'active'.
-// 5. otherwise: create a session, createLink(...), post the share link to
-//    ev.source (and to other surfaces per mirrorReplies).
+// 5. otherwise: claimAndCreateLink(...) (§2/§3 claim-then-create order), post
+//    the share link (or resume command, see §4) to ev.source and to other
+//    surfaces per mirrorReplies.
 
 export async function handleCommentEvent(ctx: HarnessCtx, ev: CommentEvent): Promise<void>
 // ev: { source, tenantId, keys: LinkKey[], commentBody, authorIsBot }
@@ -215,6 +317,32 @@ export async function handleCommentEvent(ctx: HarnessCtx, ev: CommentEvent): Pro
 ```
 
 `github-poll.ts` and `jira-poll.ts` only produce events.
+
+### 6.1 Boundary with `run-service.ts` (review finding #5)
+
+`run-service.ts` today owns: labels, status comments, branch/PR creation
+(`updateRunPr`), `run_events`, the Vibe mirror, and the redis/memory run
+queue (`ROLE=api|worker`). The harness does not replace any of that — it is
+a second entry point that decides WHICH runner path an event takes:
+
+- **Linked event** (has a `session_link` row, or its keys match one after
+  step 1-3 of `handleAssignmentEvent`/`handleCommentEvent`): routed to
+  `harness.ts` -> opencode. `run-service.ts` is not called for this event.
+- **Unlinked GitHub issue/PR** (today's normal flow, no Jira involvement):
+  unchanged, goes to `run-service.ts` -> Codex runner, exactly as it does now.
+- Decision point: `github-poll.ts` checks `resolveLink` first. A hit routes to
+  the harness; a miss falls through to the existing `run-service.ts` call.
+- The webhook path (`src/github.ts`, mounted in `index.ts`) is a second
+  GitHub entry point that also creates runs today. It needs the same
+  `resolveLink` check before its existing `run-service.ts` call, or linked
+  PRs/issues arriving via webhook bypass the harness entirely. This is a
+  required change to `src/github.ts`, not optional — added to the build
+  order in §8 as part of step 6.
+- `appendTurn` for a running turn: use `prompt_async` (§4) so a poll tick
+  never blocks on a multi-minute opencode turn. Concurrent comments on the
+  same session queue in `harness.ts` behind a per-session in-process lock
+  (single instance for v1); a second harness instance is out of scope until
+  the queue is externalized.
 
 ### GitHub poller changes this needs
 
@@ -236,11 +364,12 @@ tenants:
     jira:
       baseUrl: "https://yourorg.atlassian.net"
       projectKey: "PROJ"
+      repo: "owner/repo"                   # review finding #3: explicit mapping, one repo per project in v1
       agentAccountId: "712020:xxxx-xxxx"   # the agent's Jira account
       pollIntervalSec: 30
     opencode:
       baseUrl: "http://127.0.0.1:4096"
-      shareBaseUrl: null       # optional
+      sharingEnabled: false     # see §4 privacy note before enabling
     harness:
       mirrorReplies: "origin-only"   # or "all"
       reactivationWindowMinutes: 60
