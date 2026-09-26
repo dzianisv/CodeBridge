@@ -12,6 +12,7 @@
     "build": "tsc -p tsconfig.json",
     "lint": "eslint . --max-warnings=0",
     "test:harness": "tsx scripts/test-harness.ts",
+    "test:harness-e2e": "tsx scripts/test-harness-e2e.ts",
     "test:jira-poll": "tsx scripts/test-jira-poll.ts",
     "test:github-polling": "tsx scripts/test-github-polling.ts",
     "test:github-protocol": "tsx scripts/test-github-protocol.ts",
