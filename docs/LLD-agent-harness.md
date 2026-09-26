@@ -547,3 +547,56 @@ Each step is one card and depends on the one before it.
 - **Jira search.** `/rest/api/3/search/jql` replaced the old `/search`. It is
   Jira Cloud only. Server/Data Center uses a different endpoint and auth.
   Confirm which one the target site runs.
+
+## 10. Known open risks (merged with these tracked, not resolved on paper)
+
+Three independent review rounds on this LLD (comments on PR #13) found real
+bugs faster than each fix round closed them. Rather than a fourth
+docs-only round, this is merged with the following explicitly tracked as
+implementation-time risks. Each MUST be either closed or re-scoped by real
+code + a real test in the corresponding §8 build step, not assumed fixed by
+this document:
+
+- **§2 `repo_key` uniqueness (build step 1):** the current text does not
+  force `repo_key` to actually match `repo`, or normalize case
+  (`owner/Repo` vs `owner/repo`, `PROJ-1` vs `proj-1`). Add a `CHECK
+  (repo_key = COALESCE(repo,''))` constraint (verified to work on both
+  SQLite and Postgres) and case-fold all three columns before insert. Write
+  the duplicate-claim test from round 3's review before writing the insert
+  code (TDD), not after.
+- **§2 orphan claims after a crash (build step 1/2):** dropping the DB-level
+  FK removed a divergence bug but left a new one: a `session_link_key` row
+  that survives a mid-claim crash with no matching `session_link` row is
+  invisible to `resolveLink`'s join, permanently blocking that ticket/PR from
+  ever being claimed again. Build step 1/2 must include either a
+  reconciliation sweep (delete orphan key rows older than N minutes with no
+  session_link) or change `resolveLink` to also treat an orphan key as
+  reclaimable after a timeout. Undecided — resolve with a test, not a
+  guess, before merging that step's PR.
+- **§6.2 internal contradiction (build step 5):** the harness-hosted MCP
+  tool-server model in §6.2 is not consistently reflected elsewhere in this
+  doc (the intro, and §6's `handleCommentEvent` pseudocode, still describe
+  the harness posting replies directly). Step 5's implementation is the
+  actual source of truth for which model is real; when writing `harness.ts`,
+  pick one model, make it work end-to-end (including branch pushes without
+  handing the agent a raw token, and tool-call to link_id scoping), and
+  update this doc to match the code, not the other way around.
+- **§4a checkout-vs-session ordering (build step 3/5):** as currently
+  written, §4a wants the checkout after the `session_link` row exists, but
+  §2's ordering creates that row only after `createSession`, which (per §4a)
+  needs the checkout first — a circular dependency. Resolve by moving
+  `createSession`'s repo argument requirement earlier: checkout happens
+  during the claim window (right after §2 step 2, keyed off `link_id` which
+  already exists then), and the crash-cleanup sweep above also covers a
+  workspace left behind by a rolled-back claim. This changes §2/§4a's
+  ordering and must be updated in code + doc together when step 3 is built,
+  not left as-is.
+- **PRD not audited against these fixes.** This PR only touches
+  `docs/LLD-agent-harness.md`; `docs/PRD-agent-harness.md` has not been
+  re-checked against 3 rounds of LLD changes. Do this before or during build
+  step 7 (E2E), since the E2E test is what actually proves the PRD's
+  acceptance criteria, not a doc cross-check.
+
+None of the above blocks starting build step 1 (storage layer, `git`
+worktree/table code with real tests) — the storage schema changes needed to
+resolve the first two items are exactly what step 1 delivers.
