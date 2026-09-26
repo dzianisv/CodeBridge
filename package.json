@@ -11,6 +11,7 @@
     "start": "node dist/index.js",
     "build": "tsc -p tsconfig.json",
     "lint": "eslint . --max-warnings=0",
+    "test:jira-poll": "tsx scripts/test-jira-poll.ts",
     "test:github-polling": "tsx scripts/test-github-polling.ts",
     "test:github-protocol": "tsx scripts/test-github-protocol.ts",
     "test:vibe-agents": "tsx scripts/test-vibe-agents.ts",

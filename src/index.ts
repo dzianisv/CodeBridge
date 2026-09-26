@@ -10,6 +10,7 @@ import { createGitHubApp } from "./github.js"
 import { resolveRepo, ensureRepoPath } from "./repo.js"
 import { logger } from "./logger.js"
 import { startGitHubPolling } from "./github-poll.js"
+import { startJiraPolling } from "./jira-poll.js"
 import { createCodexNotifyHandler } from "./codex-notify.js"
 import type { AppConfig } from "./types.js"
 import { createVibeAgentsSink } from "./vibe-agents.js"
@@ -134,6 +135,16 @@ const main = async () => {
         githubPollBackfill: env.githubPollBackfill
       }
     })
+
+    // No harness yet (separate card). jira-poll logs events until harness.ts exists.
+    startJiraPolling({
+      config,
+      store,
+      env: {
+        jiraEmail: secrets.jiraEmail,
+        jiraApiToken: secrets.jiraApiToken
+      }
+    })
   }
 }
 
@@ -143,7 +154,9 @@ function resolveRuntimeSecrets(config: AppConfig, env: ReturnType<typeof loadEnv
     githubPrivateKey: config.secrets?.githubPrivateKey ?? env.githubPrivateKey,
     githubWebhookSecret: config.secrets?.githubWebhookSecret ?? env.githubWebhookSecret,
     codexNotifyToken: config.secrets?.codexNotifyToken ?? env.codexNotifyToken,
-    vibeAgentsToken: config.secrets?.vibeAgentsToken ?? env.vibeAgentsToken
+    vibeAgentsToken: config.secrets?.vibeAgentsToken ?? env.vibeAgentsToken,
+    jiraEmail: config.secrets?.jiraEmail ?? env.jiraEmail,
+    jiraApiToken: config.secrets?.jiraApiToken ?? env.jiraApiToken
   }
 }
 
