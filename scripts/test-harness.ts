@@ -20,10 +20,13 @@ import {
 } from "../src/harness.js"
 import type { AppConfig } from "../src/types.js"
 
-// Real `opencode serve` for AC1–AC4, same as scripts/test-opencode-session.ts.
+// Real `opencode serve` for AC1–AC4 and AC8–AC9, same as scripts/test-opencode-session.ts.
 // AC7 stubs createSession/appendTurn on HarnessCtx.sessions only. A real server
 // outage is not a reliable way to fail one of two concurrent calls and leave
 // the other healthy, so that one case injects the failure in-process.
+// AC8/AC9 call handleAssignmentEvent with the payload github-poll.ts builds for
+// a PR assignee: source github_pr, keys only the PR itself, plus body and branch.
+// They do not pre-resolve Closes/branch keys; harness candidateKeys does that.
 
 const execFileAsync = promisify(execFile)
 const OPENCODE_BIN = process.env.OPENCODE_BIN ?? path.join(os.homedir(), ".opencode", "bin", "opencode")
@@ -52,7 +55,9 @@ const tests: Array<[string, () => Promise<void>]> = [
   ["AC1: jira ticket assignment creates exactly one session_link row + one opencode session, share reply is returned", ac1],
   ["AC2: github PR assignment reuses an existing session_link row when the PR references an already-linked ticket", ac2],
   ["AC3/AC4: comment on either linked surface routes into the same session", ac34],
-  ["AC7: a simulated Jira failure does not affect a concurrent GitHub-sourced event", ac7]
+  ["AC7: a simulated Jira failure does not affect a concurrent GitHub-sourced event", ac7],
+  ["AC8: PR assignee with a Closes #N body reuses the linked ticket's session", ac8],
+  ["AC9: PR assignee with no linked reference gets a standalone github_pr session", ac9]
 ]
 
 let failed = 0
@@ -261,6 +266,64 @@ async function ac7() {
     assert.equal((await resolveLink(store, tenantId, [jiraKey]))?.opencodeSessionId, "jira-ac7-retry")
     assert.equal((await resolveLink(store, tenantId, [prKey]))?.opencodeSessionId, "gh-ac7")
     assert.equal(countOrphans(dbPath, tenantId), 0)
+  })
+}
+
+async function ac8() {
+  await withStore(async (store, dbPath) => {
+    const tenantId = "ac8"
+    const repo = "acme/widget"
+    const issueKey = { kind: "gh_issue" as const, repo, number: 81 }
+    const prKey = { kind: "gh_pr" as const, repo, number: 810 }
+    const created = await handleAssignmentEvent(ctxFor(store, tenantId), {
+      source: "github_issue",
+      tenantId,
+      keys: [issueKey],
+      repoPath,
+      title: "AC8 issue 81"
+    })
+    // Same shape github-poll.ts sends: the PR key only. Closes #81 is in the body.
+    const again = await handleAssignmentEvent(ctxFor(store, tenantId), {
+      source: "github_pr",
+      tenantId,
+      keys: [prKey],
+      repoPath,
+      title: "AC8 PR assignee",
+      body: "Closes #81",
+      branch: "feature/no-jira-key"
+    })
+    assert.equal(countLinks(dbPath, tenantId), 1)
+    assert.equal(again.sessionId, created.sessionId)
+    const byPr = await resolveLink(store, tenantId, [prKey])
+    const byIssue = await resolveLink(store, tenantId, [issueKey])
+    assert.equal(byPr?.opencodeSessionId, created.sessionId)
+    assert.equal(byPr?.id, byIssue?.id)
+    assert.equal(countKeys(dbPath, tenantId, "gh_pr", "810"), 1)
+    assert.equal(countKeys(dbPath, tenantId, "gh_issue", "81"), 1)
+  })
+}
+
+async function ac9() {
+  await withStore(async (store, dbPath) => {
+    const tenantId = "ac9"
+    const prKey = { kind: "gh_pr" as const, repo: "acme/widget", number: 90 }
+    const result = await handleAssignmentEvent(ctxFor(store, tenantId), {
+      source: "github_pr",
+      tenantId,
+      keys: [prKey],
+      repoPath,
+      title: "AC9 standalone PR",
+      body: "See #123 for context. No closing keyword.",
+      branch: "fix/123-foo"
+    })
+    assert.equal(countLinks(dbPath, tenantId), 1)
+    assert.equal((await resolveLink(store, tenantId, [prKey]))?.opencodeSessionId, result.sessionId)
+    assert.equal(countKeys(dbPath, tenantId, "gh_pr", "90"), 1)
+    assert.equal(countKeys(dbPath, tenantId, "gh_issue", "123"), 0)
+    assert.equal(countKeys(dbPath, tenantId, "jira", "123"), 0)
+    const status = await getSessionStatus(result.sessionId, { baseUrl, timeoutMs: 20_000 })
+    assert.notEqual(status, "not_found")
+    assert.ok(result.reply.includes(result.sessionId))
   })
 }
 
