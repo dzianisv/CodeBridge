@@ -72,16 +72,31 @@ CREATE TABLE session_link (
 -- One row can be linked to MANY identifiers (a ticket with 3 PRs, a PR closing
 -- 2 issues). This is the fix for review finding #2 (one row could only hold
 -- one Jira key + one issue + one PR + one repo).
+--
+-- `repo` is nullable (Jira keys have no repo), and NULL does not collide with
+-- itself under SQL uniqueness (`NULL <> NULL` for constraint purposes) in
+-- both Postgres and SQLite. The bare 3-column UNIQUE below silently allows
+-- the same Jira key to be claimed twice -- reproduced against local Postgres
+-- 17 and SQLite: two inserts of `(tenant, 'jira', NULL, 'PROJ-1')` both
+-- succeed. Fixed with a generated/stored non-null substitute column so the
+-- constraint actually applies to Jira rows:
 CREATE TABLE session_link_key (
-  link_id    TEXT NOT NULL REFERENCES session_link(id),
-  kind       TEXT NOT NULL,   -- 'jira' | 'gh_issue' | 'gh_pr'
-  repo       TEXT,            -- 'owner/repo', null for kind='jira'
-  value      TEXT NOT NULL,   -- jira issue key, or issue/PR number as text
-  tenant_id  TEXT NOT NULL,
-  created_at TEXT NOT NULL,
+  link_id     TEXT NOT NULL,   -- FK added AFTER session_link row exists; see claim order below
+  kind        TEXT NOT NULL,   -- 'jira' | 'gh_issue' | 'gh_pr'
+  repo        TEXT,            -- 'owner/repo', null for kind='jira'
+  repo_key    TEXT NOT NULL,   -- Postgres/SQLite portable substitute for `repo`:
+                                -- set to `repo` when not null, else the literal
+                                -- string '' so uniqueness actually fires for
+                                -- Jira rows too. Application code sets this,
+                                -- not a generated column, to stay portable
+                                -- across the two schema files.
+  value       TEXT NOT NULL,   -- jira issue key, or issue/PR number as text
+  tenant_id   TEXT NOT NULL,
+  created_at  TEXT NOT NULL,
   -- This is the actual race fix (review finding #1): a given identifier can
   -- belong to only one link, globally, enforced by the DB, not app logic.
-  UNIQUE (tenant_id, kind, repo, value)
+  -- Uses repo_key, not repo, so NULL never bypasses the constraint.
+  UNIQUE (tenant_id, kind, repo_key, value)
 );
 CREATE INDEX idx_session_link_key_link ON session_link_key (link_id);
 
@@ -92,31 +107,36 @@ CREATE TABLE jira_poll_state (
 );
 ```
 
-`UNIQUE (tenant_id, opencode_session_id)` enforces AC5 (no two rows share a
-session). `UNIQUE (tenant_id, kind, repo, value)` on `session_link_key`
-enforces the actual race condition callers care about: two pollers cannot both
-insert a key row for the same Jira ticket / GitHub issue / GitHub PR, because
-the second insert fails the constraint. This replaces the old design where
-`session_link` embedded exactly one of each identifier — that could not model
-"one ticket, three PRs" and did not stop a genuine double-bootstrap race
-(review finding #1 and #2).
-
 **Creation order (claim-then-create), fixes review finding #1's second half:**
-1. Insert the `session_link_key` row for the triggering identifier FIRST,
-   inside a transaction, with a placeholder `link_id` that does not yet have a
-   `session_link` row. If the insert fails (unique violation), someone else
-   claimed this identifier — stop, look up their `link_id`, and follow the
-   existing-row path instead of creating a session.
-2. Only after the claim succeeds, call `createSession` (opencode) and then
-   insert the `session_link` row using the same `link_id`.
-3. If step 2 fails (opencode down), delete the claimed key row so a retry
-   is possible; do not leave an orphan claim.
 
-This avoids the old ordering problem: `opencode_session_id NOT NULL` meant the
-session had to exist before the row could be inserted, which left no way to
-claim an identifier atomically before paying the cost of creating a session.
-Claiming the identifier first is cheap (a DB insert) and is the actual
-concurrency guard; the session gets created once, by whichever caller wins.
+The naive "insert key row before session_link exists" approach breaks under a
+real foreign key: Postgres rejects the insert (FK violation, no row to
+reference yet); SQLite silently accepts it because `storage.ts` never turns on
+`PRAGMA foreign_keys = ON`, so the two backends diverge. Fix: no DB-level FK
+from `session_link_key.link_id` to `session_link.id`. The relationship is an
+application invariant, checked in code and by tests, not the database. This
+also matches how `session_link_key` is deliberately allowed to exist
+momentarily with no corresponding row during the claim window below.
+
+1. Generate a new `link_id` (uuid) client-side, before either table is
+   touched.
+2. Insert the `session_link_key` row with that `link_id`, inside a
+   transaction. If the insert fails (unique violation on
+   `(tenant_id, kind, repo_key, value)`), someone else claimed this
+   identifier first — stop, look up their `link_id` via `resolveLink`, and
+   follow the existing-row path instead of creating a session.
+3. Only after the claim succeeds, call `createSession` (opencode) and then
+   insert the `session_link` row using the same `link_id`.
+4. If step 3 fails (opencode down), delete the claimed key row so a retry
+   is possible; do not leave an orphan claim.
+5. **Claim window:** between step 2 and step 3 succeeding, a `session_link_key`
+   row exists with no matching `session_link` row yet. Any comment event that
+   resolves to this `link_id` during that window must be treated as "link
+   exists but session not ready" (queue the comment / return a transient
+   retry), not as "no link" (which would create a second claim attempt) and
+   not as a null-pointer read of a nonexistent session_link row. This state is
+   normally sub-second (one DB insert plus one opencode API call) but must be
+   handled, not assumed away.
 
 ## 3. `session-links.ts` (PRD R3)
 
@@ -255,22 +275,49 @@ Config:
 Failures: if the opencode server is down, treat it like a Codex runner failure.
 Post an actionable error comment, set the link to `idle`, keep polling.
 
-## 4a. Workspace isolation (Symphony-inspired)
+## 4a. Workspace isolation (Symphony-inspired, with second-review fixes)
 
 Each `session_link` gets its own workspace directory,
-`<workspaceRoot>/<tenant_id>/<link_id>/`, checked out from `repoPath` on
-first use. This is the missing half of the repo-binding question in §4:
+`<workspaceRoot>/<sanitized(tenant_id)>/<link_id>/`, checked out from
+`repoPath` on first use. `link_id` is a server-generated uuid (§2), never
+user input; `tenant_id` MUST be validated against an allowlist pattern
+(`^[a-z0-9_-]+$`) before being used as a path segment — untrusted or
+malformed tenant config must not reach the filesystem layer unchecked.
 
-- The harness, not opencode, owns the checkout. It clones/worktrees the repo
-  into the link's workspace directory before the first `createSession` call
-  for that link, and passes that directory to whatever repo-binding mechanism
-  the opencode spike settles on (one `opencode serve` per workspace directory
-  is the leading candidate — confirm in the spike).
+- **Checkout timing vs. the claim window (§2 step 5):** the checkout must
+  happen only after the `session_link` row exists (§2 step 3), not during the
+  claim window between steps 2 and 3. Doing it earlier means a workspace can
+  exist for a `link_id` that's later rolled back (step 4, opencode failed) —
+  now an orphaned checkout with nothing referencing it.
+- **Cleanup of crashed/rolled-back claims:** if step 3 fails and step 4 rolls
+  back the key row, and a workspace was already created (should not happen per
+  the ordering above, but crashes mid-sequence are real), a periodic sweep
+  compares `<workspaceRoot>/*/*` directories against live `link_id`s in
+  `session_link` and deletes any with no matching row and no session_link_key
+  claim younger than a short grace period (e.g. 5 minutes, to avoid deleting
+  an in-flight claim).
+- **No shared checkout with `run-service.ts`:** `run-service.ts` already does
+  `git checkout -B` against its own working directory for unlinked runs (§6.1).
+  The harness's per-link workspace MUST be a separate directory tree, never the
+  same checkout `run-service.ts` uses for a repo — otherwise a harness session
+  and an unlinked run-service run on the same repo can stomp each other's
+  branch state. Use `git worktree add` from a single bare/mirror clone per
+  repo under `<workspaceRoot>/.bare/<repo>` if disk usage from N full clones
+  becomes a problem; out of scope for v1, which does N full clones.
 - Two links for the same repo never share a workspace, even if both are
-  active at once — this is what actually prevents one session's uncommitted
-  changes from bleeding into another's.
+  active at once.
 - Workspace directories persist across reactivation (§6) so a resumed session
   sees its own prior branch state, not a fresh clone.
+- **opencode server lifetime vs. harness restart (PRD AC6):** if the
+  opencode-per-workspace-directory model from the §4/§9 spike is confirmed, a
+  per-workspace server process dies when the harness process dies, and
+  restarting the harness does not automatically restart it. The harness's
+  startup/reconciliation path (referenced in Symphony's own restart-recovery
+  goal, §2.1) must re-launch a server for every `session_link` with
+  `status IN ('active','idle')` before it can accept new turns for that link,
+  or AC6 (resume within the reactivation window) silently fails after any
+  harness restart. This is a required build item for step 5 (`harness.ts`),
+  not an assumption.
 - Cleanup: delete the workspace directory only when `status = 'completed'`
   and past `reactivationWindowMinutes`, same lifecycle as the DB row's
   `completed` state. Never delete a workspace for an `active`/`idle` link.
@@ -376,37 +423,52 @@ a second entry point that decides WHICH runner path an event takes:
 - The webhook path (`src/github.ts`, mounted in `index.ts`) is a second
   GitHub entry point that also creates runs today. It needs the same
   `resolveLink` check before its existing `run-service.ts` call, or linked
-  PRs/issues arriving via webhook bypass the harness entirely. This is a
-  required change to `src/github.ts`, not optional — added to the build
-  order in §8 as part of step 6.
+  PRs/issues arriving via webhook bypass the harness entirely. **This is not
+  yet in the §8 build order below** — a second review caught that the
+  original text claimed it was in step 6 when it wasn't. Added as step 6a.
 - `appendTurn` for a running turn: use `prompt_async` (§4) so a poll tick
   never blocks on a multi-minute opencode turn. Concurrent comments on the
   same session queue in `harness.ts` behind a per-session in-process lock
   (single instance for v1); a second harness instance is out of scope until
   the queue is externalized.
 
-### 6.2 Who writes back to Jira/GitHub (Symphony-inspired)
+### 6.2 Who writes back to Jira/GitHub (Symphony-inspired, corrected)
 
-The first draft left this implicit. Following Symphony's adapter-never-writes
-rule:
+The first draft got Symphony's model backwards, and a second review caught
+it: Symphony does not hand the agent raw tracker credentials. Its own spec
+says the agent's tool calls are executed by Symphony itself, with the
+orchestrator holding the credential; "the child receives tool results, not a
+raw token." opencode's SDK also has no per-session credential/environment
+parameter to inject one — confirmed by inspecting its generated types. Handing
+the opencode process itself a scoped Jira/GitHub token is not something the
+current API supports, and even if it were, it would defeat the point (the
+credential would live inside the untrusted agent process).
 
-- The harness does not post replies itself using a bot API token. Instead, the
-  opencode session is given the tracker credentials (a scoped Jira API token
-  and a GitHub token, per tenant) as tool access, and the agent's own reply —
-  the actual comment, status transition, or PR update — is written by the
-  agent through those tools as part of its turn.
-- `harness.ts` is responsible only for: routing the event to the right
-  session, and (only as a fallback, e.g. the opencode call itself failed) for
-  posting a bot error comment saying the run failed. It is not responsible for
-  mirroring the agent's own successful reply.
-- This changes `mirrorReplies` in config (§7): it no longer means "the harness
-  copies text between surfaces" — it means "the harness's prompt to the agent
-  instructs it to reply on the other linked surfaces too." Document this
-  distinction in the prompt template, not just the config comment.
-- Credential scoping: the tenant's Jira/GitHub tokens used by the agent must
-  be least-privilege (comment + status-transition on the linked ticket, not
-  admin/org-wide), since the token now lives inside the agent's tool-call
-  surface, not just the harness process.
+Corrected model:
+
+- The harness runs a small MCP tool server (or reuses opencode's existing MCP
+  wiring) that exposes `post_jira_comment`, `post_github_comment`,
+  `transition_jira_status`, etc. as tools. This server, not the opencode
+  process, holds the tenant's Jira/GitHub credentials.
+- The opencode session calls these tools like any other MCP tool; the harness
+  process executes the actual API call server-side and returns only the
+  result to the agent. The agent never sees the token.
+- This also fixes §3.2 (PR attachment): the `post_github_comment`/"open PR"
+  tool call is the same code path that calls `attachIdentifier`, so the
+  attach happens atomically with the write, not via branch-name convention
+  matching after the fact.
+- Tool scope is per-link: the MCP server only exposes write access to the
+  ticket/repo identifiers already attached to the calling session's
+  `link_id` — enforced by the harness, not by trusting the agent's prompt.
+- `mirrorReplies` (§7) means: after a tool call succeeds on the origin
+  surface, the harness (not the agent) decides whether to also call the
+  matching tool on other linked surfaces, based on config. This keeps the
+  mirroring policy in one place instead of depending on prompt wording.
+- Bot identity, token refresh, and ADF conversion (Jira) all live in this
+  MCP tool server, alongside `jira-auth.ts`. This is new required build work,
+  not already covered elsewhere in this doc — add it to §8 step 5
+  (`harness.ts`), since the tool server and the orchestrator are delivered
+  together.
 
 ### GitHub poller changes this needs
 
@@ -450,16 +512,25 @@ tenants:
 
 Each step is one card and depends on the one before it.
 
-1. **Storage:** `session_link` and `jira_poll_state` in both schema files, store
-   methods, tests.
-2. **`session-links.ts`:** resolve, attach, conflicts. Unit tests for AC5 and §3.1.
+1. **Storage:** `session_link`, `session_link_key` (no DB-level FK between
+   them, per §2), and `jira_poll_state` in both schema files, store
+   methods, tests covering the claim-then-create sequence and the
+   Jira-NULL-repo unique-constraint case.
+2. **`session-links.ts`:** resolve, attach, conflicts. Unit tests for AC5, §3.1,
+   and the claim-window state from §2 step 5.
 3. **`opencode-session.ts`:** tests against a real local `opencode serve`. It is
    under our control, so do not mock it.
 4. **`jira-poll.ts`:** poll loop and client. Unit tests use a fake Jira server,
    since Jira Cloud is outside local test control.
-5. **`harness.ts`:** wire 2–4. Real tests for AC1–AC4 live here.
+5. **`harness.ts`:** wire 2–4, plus the MCP tool server from §6.2
+   (`post_jira_comment`, `post_github_comment`, `transition_jira_status`).
+   Real tests for AC1–AC4 live here.
 6. **`github-poll.ts` PR trigger (R2):** smallest change, done last so it routes
    into a tested harness.
+6a. **`src/github.ts` webhook path:** add the same `resolveLink` check ahead
+   of its existing `run-service.ts` call (§6.1). Depends on step 5 being
+   done; without this step, linked PRs/issues arriving via webhook silently
+   bypass the harness.
 7. **E2E**, added to `docs/test-protocol.md` and a `scripts/test-*.ts` runner:
    assign Jira ticket → session created → comment on linked PR → same session
    → Jira comment → same session. This test proves the PRD.
