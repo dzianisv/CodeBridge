@@ -84,6 +84,8 @@ async function main() {
     ["sqlite: repo_key is derived and case-folded", () => withSqlite(derivedRepoKey)],
     ["sqlite: orphan claim is reclaimed after the timeout", () => withSqlite(orphanReclaim)],
     ["sqlite: a promoted link is not reclaimed", () => withSqlite(liveLinkNotReclaimed)],
+    ["sqlite: abandon deletes a fresh unpromoted claim only", () => withSqlite(abandonFreshClaim)],
+    ["sqlite: abandon does not delete a promoted link", () => withSqlite(abandonPromoted)],
     ["sqlite: resolve conflict and promote", () => withSqlite(resolveAndPromote)],
     ["sqlite: jira poll cursor upserts", () => withSqlite(jiraCursor)],
     ["postgres: two concurrent jira claims fail-fast", () => postgresRace("jira")],
@@ -94,6 +96,8 @@ async function main() {
     ["postgres: repo_key is derived and case-folded", () => withPostgres(derivedRepoKey)],
     ["postgres: orphan claim is reclaimed after the timeout", () => withPostgres(orphanReclaim)],
     ["postgres: a promoted link is not reclaimed", () => withPostgres(liveLinkNotReclaimed)],
+    ["postgres: abandon deletes a fresh unpromoted claim only", () => withPostgres(abandonFreshClaim)],
+    ["postgres: abandon does not delete a promoted link", () => withPostgres(abandonPromoted)],
     ["postgres: resolve conflict and promote", () => withPostgres(resolveAndPromote)],
     ["postgres: jira poll cursor upserts", () => withPostgres(jiraCursor)]
   ]
@@ -332,6 +336,48 @@ async function orphanReclaim(probe: Probe) {
     assert.equal(await probe.countKeys(tenantId, "gh_pr", "acme/widget", "3"), 1)
     const row = await probe.readKey(tenantId, "gh_pr", "acme/widget", "3")
     assert.equal(row?.link_id, replacementId)
+}
+
+async function abandonFreshClaim(probe: Probe) {
+  const tenantId = "tenant-abandon"
+  const key: SessionLinkKeyInput = { kind: "jira", issueKey: "ABN-1" }
+  const sibling: SessionLinkKeyInput = { kind: "gh_issue", repo: "acme/widget", number: 2 }
+  const linkId = randomUUID()
+  await probe.store.claimSessionLinkKey({ linkId, tenantId, key })
+  await probe.store.claimSessionLinkKey({
+    linkId,
+    tenantId,
+    key: { kind: "gh_pr", repo: "acme/widget", number: 2 }
+  })
+  const otherId = randomUUID()
+  await probe.store.claimSessionLinkKey({ linkId: otherId, tenantId, key: sibling })
+  await probe.store.abandonSessionLinkClaim({ tenantId, linkId })
+  assert.equal(await probe.countKeys(tenantId, "jira", "", "abn-1"), 0)
+  assert.equal(await probe.countKeys(tenantId, "gh_pr", "acme/widget", "2"), 0)
+  assert.equal((await probe.store.resolveSessionLink({ tenantId, keys: [key] })).state, "none")
+  assert.equal(await probe.countKeys(tenantId, "gh_issue", "acme/widget", "2"), 1)
+  await probe.store.abandonSessionLinkClaim({ tenantId, linkId: randomUUID() })
+  assert.equal(await probe.countKeys(tenantId, "gh_issue", "acme/widget", "2"), 1)
+  const replacementId = randomUUID()
+  const replacement = await probe.store.claimSessionLinkKey({ linkId: replacementId, tenantId, key })
+  assert.equal(replacement.linkId, replacementId)
+}
+
+async function abandonPromoted(probe: Probe) {
+  const tenantId = "tenant-abandon-live"
+  const key: SessionLinkKeyInput = { kind: "gh_pr", repo: "acme/widget", number: 11 }
+  const linkId = randomUUID()
+  await probe.store.claimSessionLinkKey({ linkId, tenantId, key })
+  await probe.store.promoteSessionLinkClaim({
+    linkId,
+    tenantId,
+    opencodeSessionId: `session-${linkId}`
+  })
+  await probe.store.abandonSessionLinkClaim({ tenantId, linkId })
+  assert.equal(await probe.countKeys(tenantId, "gh_pr", "acme/widget", "11"), 1)
+  const resolved = await probe.store.resolveSessionLink({ tenantId, keys: [key] })
+  assert.equal(resolved.state, "linked")
+  if (resolved.state === "linked") assert.equal(resolved.link.opencodeSessionId, `session-${linkId}`)
 }
 
 async function liveLinkNotReclaimed(probe: Probe) {
