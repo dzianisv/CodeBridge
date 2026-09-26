@@ -25,12 +25,18 @@ type Recorded = {
 }
 
 const recorded: Recorded[] = []
+let myselfTimeZone = "UTC"
 let handler: (req: IncomingMessage, body: any) => Promise<{ status: number; json: unknown }> = async () => ({
   status: 200,
   json: { issues: [], isLast: true, nextPageToken: null }
 })
 
 const server = createServer((req, res) => {
+  if (req.url?.startsWith("/rest/api/3/myself")) {
+    recorded.push({ method: req.method, url: req.url, authorization: req.headers.authorization, body: undefined })
+    sendJson(res, 200, { timeZone: myselfTimeZone })
+    return
+  }
   void readBody(req).then(async body => {
     recorded.push({
       method: req.method,
@@ -62,6 +68,7 @@ try {
   await testIntervalFloor()
   await testConfigSchema(dir)
   await testPollStatePersists()
+  await testNonUtcSiteTimezoneUsedInJql()
   await testCursorOverlapDedupeAndPagination()
   await testPartialCommentPage()
   await testTenantIsolationAndFailedTick()
@@ -100,7 +107,14 @@ async function testAuthHeader() {
   assert.equal(AUTH, `Basic ${Buffer.from(`${EMAIL}:${TOKEN}`, "utf8").toString("base64")}`)
   assert.equal(jiraPollIntervalMs(1), 10000)
   assert.equal(jiraPollIntervalMs(30), 30000)
-  assert.equal(formatJqlUpdated(new Date("2024-01-01T00:01:30.000Z")), "2024-01-01 00:01")
+  assert.equal(formatJqlUpdated(new Date("2024-01-01T00:01:30.000Z"), "UTC"), "2024-01-01 00:01")
+  // Non-UTC site timezone: this is the regression this task exists for. If
+  // formatJqlUpdated ever goes back to hardcoding UTC math, this assertion
+  // catches it -- America/Los_Angeles is UTC-8 in January (no DST), so the
+  // same instant must format 8 hours earlier in wall-clock terms.
+  assert.equal(formatJqlUpdated(new Date("2024-01-01T00:01:30.000Z"), "America/Los_Angeles"), "2023-12-31 16:01")
+  // DST case: America/Los_Angeles is UTC-7 in July.
+  assert.equal(formatJqlUpdated(new Date("2024-07-01T00:01:30.000Z"), "America/Los_Angeles"), "2024-06-30 17:01")
 }
 
 async function testIntervalFloor() {
@@ -192,6 +206,39 @@ async function testPollStatePersists() {
   assert.ok(state?.updatedAt)
   await store.updateJiraPollState({ tenantId: "local", lastCursor: "2024-01-01T00:06:00.000+0000" })
   assert.equal((await reloaded.getJiraPollState("local"))?.lastCursor, "2024-01-01T00:06:00.000+0000")
+}
+
+// Regression for the bug this task exists for: an unqualified JQL `updated`
+// literal is interpreted in the SITE's configured timezone, not UTC. Injects
+// a non-UTC /rest/api/3/myself response and asserts the JQL literal on the
+// wire reflects that zone's wall-clock time, not a UTC-only formatting.
+async function testNonUtcSiteTimezoneUsedInJql() {
+  recorded.length = 0
+  myselfTimeZone = "America/Los_Angeles"
+  try {
+    const file = path.join(dir, "tz.db")
+    const store = createStore(`sqlite:${file}`)
+    await store.ensureSchema()
+    // Fixed instant far enough from any DST edge for a stable, hand-verifiable
+    // offset: 2024-01-15T00:02:00Z, PST (UTC-8) -> 2024-01-14 16:02 local.
+    await store.updateJiraPollState({ tenantId: "local", lastCursor: "2024-01-15T00:02:00.000Z" })
+    const events = collect()
+    handler = async () => ({ status: 200, json: { issues: [], isLast: true, nextPageToken: null } })
+    const loop = loopFor(store, events.harness)
+    await loop.tick()
+    const myselfCalls = recorded.filter(item => item.url?.startsWith("/rest/api/3/myself"))
+    assert.equal(myselfCalls.length, 1)
+    const search = recorded.filter(item => item.url === "/rest/api/3/search/jql")
+    assert.equal(search.length, 1)
+    assert.match(search[0]?.body.jql, /updated >= "2024-01-14 16:01"/)
+
+    // Second tick within the same loop must not re-fetch /myself -- cached
+    // per tenant for the loop's lifetime.
+    await loop.tick()
+    assert.equal(recorded.filter(item => item.url?.startsWith("/rest/api/3/myself")).length, 1)
+  } finally {
+    myselfTimeZone = "UTC"
+  }
 }
 
 async function testCursorOverlapDedupeAndPagination() {
@@ -467,13 +514,13 @@ async function testIntervalTimerFloor() {
   })
   assert.equal(typeof stop, "function")
   const deadline = Date.now() + 2000
-  while (recorded.length === 0 && Date.now() < deadline) {
+  while (recorded.filter(item => item.url === "/rest/api/3/search/jql").length === 0 && Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, 20))
   }
-  assert.equal(recorded.length, 1)
+  assert.equal(recorded.filter(item => item.url === "/rest/api/3/search/jql").length, 1)
   await new Promise(resolve => setTimeout(resolve, 2500))
   stop?.()
-  assert.equal(recorded.length, 1)
+  assert.equal(recorded.filter(item => item.url === "/rest/api/3/search/jql").length, 1)
 }
 
 function loopFor(store: ReturnType<typeof createStore>, harness: JiraPollHarness) {

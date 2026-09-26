@@ -63,16 +63,52 @@ export function jiraPollIntervalMs(intervalSec: number): number {
 // "yyyy-MM-dd HH:mm", "yyyy/MM/dd HH:mm", "yyyy-MM-dd", "yyyy/MM/dd".
 // Source: https://support.atlassian.com/jira-software-cloud/docs/jql-fields/
 // (Updated field, fetched 2026-09-25): results are "relative to your configured
-// time zone (which is by default the Jira server's time zone)". We format UTC.
-// That default is unconfirmed without a live site; the 60s overlap does not cover
-// a multi-hour offset. Dedupe is the other half of LLD review finding #8.
-export function formatJqlUpdated(date: Date): string {
-  const y = date.getUTCFullYear()
-  const m = String(date.getUTCMonth() + 1).padStart(2, "0")
-  const d = String(date.getUTCDate()).padStart(2, "0")
-  const hh = String(date.getUTCHours()).padStart(2, "0")
-  const mm = String(date.getUTCMinutes()).padStart(2, "0")
-  return `${y}-${m}-${d} ${hh}:${mm}`
+// time zone (which is by default the Jira server's time zone)". An unqualified
+// literal is NOT UTC -- it is interpreted in the site's configured timezone.
+// Verified live 2026-09-26 against https://vibeteaichnologies.atlassian.net
+// (site tz America/Los_Angeles): a UTC-formatted "now" literal returned 0
+// issues; the same instant formatted in site-local time returned the real,
+// freshly-assigned KAN-4. `timeZone` must be an IANA zone name (e.g. the
+// value returned by GET /rest/api/3/myself's `timeZone` field for the poller's
+// account) -- see getJiraTimeZone below. Formatting in the wrong zone silently
+// drops assignments/comments; there is no fallback that is safe to guess.
+export function formatJqlUpdated(date: Date, timeZone: string): string {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  })
+  const parts = Object.fromEntries(formatter.formatToParts(date).map(part => [part.type, part.value]))
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`
+}
+
+// GET /rest/api/3/myself returns the *caller's* (agent account's) configured
+// timeZone, not necessarily the site/project's timezone -- Jira does not expose
+// a documented "site configured timezone" endpoint for JQL date-literal
+// evaluation, and Atlassian support confirms JQL date literals are evaluated
+// relative to the *searching user's* timezone preference, which for a bot
+// account polling via basic auth is this same account. So the agent account's
+// own timeZone is the correct (and only available) value to use here -- it is
+// not a proxy for something else. Falls back to "UTC" only if the field is
+// missing entirely (never silently misinterpreted as e.g. server default).
+export async function getJiraTimeZone(input: { baseUrl: string; authHeader: string }): Promise<string> {
+  const url = new URL("/rest/api/3/myself", stripSlash(input.baseUrl))
+  const response = await fetch(url, {
+    headers: {
+      authorization: input.authHeader,
+      accept: "application/json"
+    }
+  })
+  if (!response.ok) {
+    const detail = await response.text()
+    throw new Error(`Jira myself lookup failed (${response.status}): ${detail.slice(0, 300)}`)
+  }
+  const payload = await response.json() as { timeZone?: string }
+  return payload.timeZone ?? "UTC"
 }
 
 export function startJiraPolling(params: {
@@ -121,6 +157,7 @@ export function createJiraPollLoop(params: {
   // that table exists; do not invent session_link here.
   const seenBootstrap = new Set<string>()
   const seenComments = new Set<string>()
+  const timeZoneCache = new Map<string, string>()
   let running = false
 
   const tick = async () => {
@@ -137,7 +174,8 @@ export function createJiraPollLoop(params: {
             authHeader,
             now,
             seenBootstrap,
-            seenComments
+            seenComments,
+            timeZoneCache
           })
         } catch (error) {
           logger.error({ err: error, tenantId: tenant.id }, "Jira polling failed")
@@ -223,6 +261,7 @@ async function pollTenant(input: {
   now: () => Date
   seenBootstrap: Set<string>
   seenComments: Set<string>
+  timeZoneCache: Map<string, string>
 }) {
   const jira = input.tenant.jira
   if (!jira) return
@@ -234,12 +273,21 @@ async function pollTenant(input: {
     throw new Error(`Jira repo ${jira.repo} is not in tenant ${input.tenant.id} repos`)
   }
 
+  // Cached per tenant for the lifetime of the poller. A configured timezone
+  // does not change tick-to-tick; refetching every 10-60s buys nothing and
+  // costs an extra Jira call per tenant per tick.
+  let timeZone = input.timeZoneCache.get(input.tenant.id)
+  if (!timeZone) {
+    timeZone = await getJiraTimeZone({ baseUrl: jira.baseUrl, authHeader: input.authHeader })
+    input.timeZoneCache.set(input.tenant.id, timeZone)
+  }
+
   const state = await input.store.getJiraPollState(input.tenant.id)
   const nowIso = input.now().toISOString()
   const cursor = state?.lastCursor ?? nowIso
   const cursorMs = Date.parse(cursor)
   const lowerBound = new Date((Number.isFinite(cursorMs) ? cursorMs : Date.parse(nowIso)) - OVERLAP_MS)
-  const jql = `project = ${jira.projectKey} AND updated >= "${formatJqlUpdated(lowerBound)}" ORDER BY updated ASC`
+  const jql = `project = ${jira.projectKey} AND updated >= "${formatJqlUpdated(lowerBound, timeZone)}" ORDER BY updated ASC`
 
   const issues = await searchJiraIssues({
     baseUrl: jira.baseUrl,
