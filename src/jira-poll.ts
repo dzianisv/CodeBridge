@@ -1,7 +1,7 @@
 import type { AppConfig, TenantConfig } from "./types.js"
 import { SessionLinkResolveConflictError, type RunStore } from "./storage.js"
 import { buildJiraBasicAuthHeader } from "./jira-auth.js"
-import { adfToText, type JiraComment, type JiraIssue, type JiraSearchAndReconcileResults } from "./jira-types.js"
+import { adfToText, textToAdf, type JiraComment, type JiraIssue, type JiraSearchAndReconcileResults } from "./jira-types.js"
 import { logger } from "./logger.js"
 import { handleAssignmentEvent, handleCommentEvent, type HarnessCtx } from "./harness.js"
 
@@ -13,8 +13,10 @@ export type JiraPollEnv = {
 // Kept as a callback interface so jira-poll unit tests can inject a collector
 // without booting opencode. Production (and a missing harness argument) uses
 // createHarnessBackedJiraPoller, which calls handleAssignmentEvent /
-// handleCommentEvent. The poller still does not import session-links or
-// opencode directly. github-poll.ts is not wired here (LLD step 6, later card).
+// handleCommentEvent and posts the assignment reply back to the ticket via
+// postJiraComment (LLD §6.2). Comment events do not write back yet -- only
+// the assignment path is wired here. github-poll.ts is not wired here (LLD
+// step 6, tracked separately).
 export type JiraAssignmentEvent = {
   source: "jira"
   tenantId: string
@@ -24,6 +26,11 @@ export type JiraAssignmentEvent = {
   repoPath: string
   title: string
   assigneeAccountId: string
+  // Carried so onAssignmentEvent can post the session reply back onto the
+  // ticket (LLD §6.2 post_jira_comment) without re-deriving tenant config.
+  // Same baseUrl/authHeader pollTenant already has for this tick.
+  jiraBaseUrl: string
+  authHeader: string
 }
 
 export type JiraCommentEvent = {
@@ -151,8 +158,9 @@ export function createJiraPollLoop(params: {
 export function createHarnessBackedJiraPoller(ctx: HarnessCtx): JiraPollHarness {
   return {
     async onAssignmentEvent(ev) {
+      let result
       try {
-        await handleAssignmentEvent(ctx, {
+        result = await handleAssignmentEvent(ctx, {
           source: "jira",
           tenantId: ev.tenantId,
           keys: [{ kind: "jira", issueKey: ev.issueKey }],
@@ -165,6 +173,22 @@ export function createHarnessBackedJiraPoller(ctx: HarnessCtx): JiraPollHarness 
           return
         }
         throw error
+      }
+      // LLD §6.2 write-back. handleAssignmentEvent already computed the reply
+      // (share link or resume-command fallback); post it here so the ticket
+      // shows where the session lives. A failed post does not undo the link/
+      // session creation above -- log and move on, do not throw and re-run
+      // the tick (that would re-create nothing since seenBootstrap is set,
+      // but would spam retries against Jira for a transient 5xx).
+      try {
+        await postJiraComment({
+          baseUrl: ev.jiraBaseUrl,
+          authHeader: ev.authHeader,
+          issueKey: ev.issueKey,
+          body: result.reply
+        })
+      } catch (error) {
+        logger.error({ err: error, tenantId: ev.tenantId, issueKey: ev.issueKey }, "failed to post session link back to Jira ticket")
       }
     },
     async onCommentEvent(ev) {
@@ -244,7 +268,9 @@ async function pollTenant(input: {
         repo: jira.repo,
         repoPath: repo.path,
         title: issue.fields?.summary ?? issue.key,
-        assigneeAccountId: assigneeId
+        assigneeAccountId: assigneeId,
+        jiraBaseUrl: jira.baseUrl,
+        authHeader: input.authHeader
       })
       input.seenBootstrap.add(bootstrapKey)
     }
@@ -406,6 +432,31 @@ async function loadComments(input: {
 
 function searchUrl(baseUrl: string): string {
   return `${stripSlash(baseUrl)}/rest/api/3/search/jql`
+}
+
+// LLD §6.2 post_jira_comment. Called from onAssignmentEvent so a fresh
+// session's share/resume reply lands on the ticket. Callers decide whether a
+// failed post should be fatal; this function only does the network call.
+export async function postJiraComment(input: {
+  baseUrl: string
+  authHeader: string
+  issueKey: string
+  body: string
+}): Promise<void> {
+  const url = new URL(`/rest/api/3/issue/${encodeURIComponent(input.issueKey)}/comment`, stripSlash(input.baseUrl))
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      authorization: input.authHeader,
+      accept: "application/json",
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({ body: textToAdf(input.body) })
+  })
+  if (!response.ok) {
+    const detail = await response.text()
+    throw new Error(`Jira comment post failed (${response.status}): ${detail.slice(0, 300)}`)
+  }
 }
 
 function stripSlash(baseUrl: string): string {

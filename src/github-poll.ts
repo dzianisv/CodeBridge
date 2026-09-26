@@ -1,7 +1,8 @@
 import type { AppConfig, RepoConfig, TenantConfig } from "./types.js"
 import { SessionLinkResolveConflictError, type RunStore } from "./storage.js"
 import type { RunService } from "./run-service.js"
-import { handleAssignmentEvent, type HarnessCtx } from "./harness.js"
+import { handleAssignmentEvent, handleCommentEvent, type HarnessCtx } from "./harness.js"
+import { resolveLink, SessionLinkPendingError } from "./session-links.js"
 import { createInstallationClient, formatPrivateKey } from "./github-auth.js"
 import { extractCommand, extractCommandFromManagedIssue, type CommandType } from "./commands.js"
 import {
@@ -153,7 +154,7 @@ export function startGitHubPolling(params: {
     const defaultPrefixes = pending.length > 0
       ? await resolveDefaultPrefixesWithTimeout(defaultPrefixesPromise)
       : []
-    const issueMetaByNumber = new Map<number, { title: string; body?: string; managed: boolean }>()
+    const issueMetaByNumber = new Map<number, { title: string; body?: string; managed: boolean; isPullRequest: boolean }>()
 
     const getIssueMeta = async (issueNumber: number) => {
       const cached = issueMetaByNumber.get(issueNumber)
@@ -167,7 +168,8 @@ export function startGitHubPolling(params: {
       const meta = {
         title: issue.data.title,
         body: issue.data.body ?? undefined,
-        managed: hasManagedLabel(issue.data.labels)
+        managed: hasManagedLabel(issue.data.labels),
+        isPullRequest: Boolean(issue.data.pull_request)
       }
       issueMetaByNumber.set(issueNumber, meta)
       return meta
@@ -180,6 +182,42 @@ export function startGitHubPolling(params: {
 
         const issueNumber = parseIssueNumber(comment.issue_url)
         if (!issueNumber) continue
+
+        // A comment on a PR/issue with an active session_link is a turn in
+        // that session (LLD §6), same routing #18 gave the assignment path.
+        // resolveLink is checked before the legacy command-prefix gate; a
+        // miss (or an ambiguous/pending link) falls through unchanged.
+        const issueMetaForLink = await getIssueMeta(issueNumber)
+        const linkKey = issueMetaForLink.isPullRequest
+          ? { kind: "gh_pr" as const, repo: repoFullName, number: issueNumber }
+          : { kind: "gh_issue" as const, repo: repoFullName, number: issueNumber }
+        try {
+          const existingLink = await resolveLink(store, tenant.id, [linkKey])
+          if (existingLink) {
+            await handleCommentEvent(harness, {
+              source: issueMetaForLink.isPullRequest ? "github_pr" : "github_issue",
+              tenantId: tenant.id,
+              keys: [linkKey],
+              commentBody: comment.body,
+              authorIsBot: false,
+              repoPath: await ensureRepoPath(repo),
+              title: issueMetaForLink.title
+            })
+            continue
+          }
+        } catch (error) {
+          if (error instanceof SessionLinkPendingError) throw error
+          if (error instanceof SessionLinkResolveConflictError) {
+            logger.warn({
+              err: error,
+              tenantId: tenant.id,
+              repo: repoFullName,
+              issueNumber
+            }, "github comment keys resolve to more than one session link; not routing")
+            continue
+          }
+          throw error
+        }
 
         const assigneePrefixes = buildAssigneeMentionPrefixes(tenant.github?.assignmentAssignees)
         const prefixes = mergeGithubCommandPrefixes(
