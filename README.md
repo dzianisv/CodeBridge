@@ -159,6 +159,50 @@ Comment in issue/PR/discussion:
 
 On managed issues, plain non-bot comments are treated as follow-up prompts.
 
+## Jira Integration (Local Test)
+
+CodeBridge also polls Jira Cloud directly (no webhook needed) and links a Jira issue, its GitHub issue/PR, and the opencode session into one thread. Comments on any linked surface route back to the same session.
+
+### 1. Configure a Jira tenant
+
+Add a `jira` block to a tenant in `config/tenants.yaml` (or `~/.config/codebridge/config.yaml`):
+
+```yaml
+tenants:
+  - id: local
+    jira:
+      baseUrl: "https://your-site.atlassian.net"
+      projectKey: "KAN"
+      repo: "owner/repo"                 # must match a repo in this tenant's `repos:` list
+      agentAccountId: "712020:xxxxxxxx"  # Jira accountId that issues get assigned to
+      pollIntervalSec: 15
+```
+
+Find `agentAccountId` for any account with:
+
+```bash
+curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" "$JIRA_BASE_URL/rest/api/3/myself" | jq .accountId
+```
+
+### 2. Set Jira credentials
+
+```bash
+export JIRA_EMAIL=you@example.com
+export JIRA_API_TOKEN=...        # Jira Cloud API token, not your account password
+```
+
+Polling is silently disabled (with a one-line startup warning) if either var is missing — check `pnpm dev` logs for `"Jira polling disabled: missing JIRA_EMAIL or JIRA_API_TOKEN"`.
+
+### 3. Run and test
+
+```bash
+pnpm dev
+```
+
+Then in Jira: create an issue in the configured project and **assign it to the `agentAccountId` account**. Within one `pollIntervalSec` window, CodeBridge picks it up, starts a Codex run against the mapped local repo, and comments back on the ticket with a session link. Comment again on the same ticket afterward to continue the same session.
+
+There is no Jira-side success log line by design (only a warn on misconfiguration) — confirm pickup via the ticket comment, the local run record, or `data/codex-bridge.db`.
+
 ## Promptfoo Evaluation (Live Bot Quality)
 
 CodeBridge includes a custom promptfoo provider (`eval/provider.ts`) that:
