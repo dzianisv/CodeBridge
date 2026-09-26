@@ -1,6 +1,7 @@
 import type { AppConfig, RepoConfig, TenantConfig } from "./types.js"
-import type { RunStore } from "./storage.js"
+import { SessionLinkResolveConflictError, type RunStore } from "./storage.js"
 import type { RunService } from "./run-service.js"
+import { handleAssignmentEvent, type HarnessCtx } from "./harness.js"
 import { createInstallationClient, formatPrivateKey } from "./github-auth.js"
 import { extractCommand, extractCommandFromManagedIssue, type CommandType } from "./commands.js"
 import {
@@ -26,9 +27,10 @@ export function startGitHubPolling(params: {
   config: AppConfig
   store: RunStore
   runService: RunService
+  harness: HarnessCtx
   env: GitHubPollEnv
 }) {
-  const { config, store, runService, env } = params
+  const { config, store, runService, harness, env } = params
   if (!env.githubAppId || !env.githubPrivateKey) {
     logger.warn("GitHub polling disabled: missing GITHUB_APP_ID or GITHUB_PRIVATE_KEY")
     return
@@ -94,6 +96,16 @@ export function startGitHubPolling(params: {
       client,
       store,
       runService,
+      appIdentityPromise
+    })
+
+    await pollAssignedPullRequests({
+      tenant,
+      repo,
+      owner,
+      repoName,
+      client,
+      harness,
       appIdentityPromise
     })
 
@@ -360,6 +372,89 @@ async function pollAssignedIssues(input: {
         issueBody: issue.body ?? undefined
       }
     })
+  }
+}
+
+// PR assignment is a harness trigger, not a Codex run. pollAssignedIssues
+// still skips pull_request items so this does not double-bootstrap run-service.
+// Do not resolve Closes/branch/hints here: candidateKeys() in harness.ts is
+// the only precedence. This only fills AssignmentEvent and hands it off.
+async function pollAssignedPullRequests(input: {
+  tenant: TenantConfig
+  repo: RepoConfig
+  owner: string
+  repoName: string
+  client: GitHubClient
+  harness: HarnessCtx
+  appIdentityPromise: Promise<{ slug?: string; botLogin?: string } | null>
+}): Promise<void> {
+  const appIdentity = await resolveAppIdentityWithTimeout(input.appIdentityPromise)
+  const assignees = resolveAssignmentAssignees(input.tenant.github?.assignmentAssignees, appIdentity?.botLogin)
+  if (assignees.length === 0) return
+
+  const numbers = new Set<number>()
+  for (const assignee of assignees) {
+    let response: Awaited<ReturnType<typeof input.client.octokit.issues.listForRepo>>
+    try {
+      response = await input.client.octokit.issues.listForRepo({
+        owner: input.owner,
+        repo: input.repoName,
+        state: "open",
+        assignee,
+        per_page: 100,
+        sort: "updated",
+        direction: "desc"
+      })
+    } catch (error) {
+      logger.warn({
+        err: error,
+        tenantId: input.tenant.id,
+        repoFullName: input.repo.fullName,
+        assignee
+      }, "Skipping invalid assignment assignee in PR polling")
+      continue
+    }
+    for (const issue of response.data) {
+      if (!issue.pull_request || !issue.number) continue
+      numbers.add(issue.number)
+    }
+  }
+  if (numbers.size === 0) return
+
+  const repoPath = await ensureRepoPath(input.repo)
+  for (const number of numbers) {
+    try {
+      const pr = await input.client.octokit.pulls.get({
+        owner: input.owner,
+        repo: input.repoName,
+        pull_number: number
+      })
+      await handleAssignmentEvent(input.harness, {
+        source: "github_pr",
+        tenantId: input.tenant.id,
+        keys: [{ kind: "gh_pr", repo: input.repo.fullName, number }],
+        repoPath,
+        title: pr.data.title,
+        body: pr.data.body ?? undefined,
+        branch: pr.data.head.ref
+      })
+    } catch (error) {
+      if (error instanceof SessionLinkResolveConflictError) {
+        logger.warn({
+          err: error,
+          tenantId: input.tenant.id,
+          repoFullName: input.repo.fullName,
+          number
+        }, "github pr assignment conflict; not routing")
+        continue
+      }
+      logger.error({
+        err: error,
+        tenantId: input.tenant.id,
+        repoFullName: input.repo.fullName,
+        number
+      }, "GitHub PR assignment polling failed")
+    }
   }
 }
 

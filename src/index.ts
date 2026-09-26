@@ -128,6 +128,7 @@ const main = async () => {
       config,
       store,
       runService,
+      harness: { store, config },
       env: {
         githubAppId: secrets.githubAppId,
         githubPrivateKey: secrets.githubPrivateKey,
@@ -136,8 +137,9 @@ const main = async () => {
       }
     })
 
-    // Linked Jira events go to harness.ts. github-poll.ts still calls
-    // run-service directly (LLD step 6, not this card).
+    // Issue assignment and mentions still go to run-service. PR assignment
+    // uses the HarnessCtx passed into startGitHubPolling. Linked Jira events
+    // go to harness.ts as well.
     startJiraPolling({
       config,
       store,
