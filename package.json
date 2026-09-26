@@ -15,6 +15,7 @@
     "test:github-polling": "tsx scripts/test-github-polling.ts",
     "test:github-protocol": "tsx scripts/test-github-protocol.ts",
     "test:vibe-agents": "tsx scripts/test-vibe-agents.ts",
+    "test:opencode-session": "tsx scripts/test-opencode-session.ts",
     "eval": "env -u GITHUB_TOKEN -u AZURE_OPENAI_BASE_URL promptfoo eval",
     "eval:serial": "env -u GITHUB_TOKEN -u AZURE_OPENAI_BASE_URL promptfoo eval -j 1",
     "eval:view": "promptfoo view"
