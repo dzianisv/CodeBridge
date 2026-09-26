@@ -29,11 +29,20 @@ const githubSchema = z.object({
   assignmentAssignees: z.array(z.string()).optional()
 })
 
+const jiraSchema = z.object({
+  baseUrl: z.string().url(),
+  projectKey: z.string().regex(/^[A-Z][A-Z0-9_]+$/),
+  repo: z.string().regex(/^[^/\s]+\/[^/\s]+$/),
+  agentAccountId: z.string().min(1),
+  pollIntervalSec: z.number().int().positive()
+})
+
 const tenantSchema = z.object({
   id: z.string(),
   name: z.string(),
   slack: slackSchema.optional(),
   github: githubSchema.optional(),
+  jira: jiraSchema.optional(),
   repos: z.array(repoSchema),
   defaultRepo: z.string().optional()
 })
@@ -43,7 +52,9 @@ const secretsSchema = z.object({
   githubPrivateKey: z.string().optional(),
   githubWebhookSecret: z.string().optional(),
   codexNotifyToken: z.string().optional(),
-  vibeAgentsToken: z.string().optional()
+  vibeAgentsToken: z.string().optional(),
+  jiraEmail: z.string().optional(),
+  jiraApiToken: z.string().optional()
 })
 
 const vibeAgentsSchema = z.object({
@@ -89,6 +100,8 @@ export type EnvConfig = {
   vibeAgentsProject?: string
   vibeAgentsEnabled?: boolean
   vibeAgentsTimeoutMs?: number
+  jiraEmail?: string
+  jiraApiToken?: string
   configPath: string
 }
 
@@ -130,6 +143,8 @@ export function loadEnv(): EnvConfig {
     vibeAgentsProject: process.env.VIBE_AGENTS_PROJECT,
     vibeAgentsEnabled: process.env.VIBE_AGENTS_ENABLED ? parseBoolean(process.env.VIBE_AGENTS_ENABLED) : undefined,
     vibeAgentsTimeoutMs: Number.isFinite(vibeAgentsTimeoutMsParsed) ? vibeAgentsTimeoutMsParsed : undefined,
+    jiraEmail: process.env.JIRA_EMAIL,
+    jiraApiToken: process.env.JIRA_API_TOKEN,
     configPath
   }
 }

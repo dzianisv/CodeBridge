@@ -6,6 +6,9 @@ secrets:
   # githubWebhookSecret: "optional-webhook-secret"
   # codexNotifyToken: "optional-notify-token"
   # vibeAgentsToken: "optional-vibe-agents-token"
+  # Jira API token. Prefer JIRA_EMAIL / JIRA_API_TOKEN env vars. Never commit a real token.
+  # jiraEmail: "agent@example.com"
+  # jiraApiToken: "optional-jira-api-token"
 
 integrations:
   # Optional external sink for agent session dashboards.
@@ -26,6 +29,13 @@ tenants:
         - "codex:"
         - "/codex"
         - "@codex"
+    # Optional. Omit to leave Jira polling off. Email/token stay in secrets or env, not here.
+    # jira:
+    #   baseUrl: "https://yourorg.atlassian.net"
+    #   projectKey: "PROJ"
+    #   repo: "owner/repo"
+    #   agentAccountId: "712020:example"
+    #   pollIntervalSec: 30
     github:
       installationId: 123456
       # Optional: assignment bootstrap handles.

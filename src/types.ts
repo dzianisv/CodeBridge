@@ -10,6 +10,15 @@ export type GitHubConfig = {
   assignmentAssignees?: string[]
 }
 
+// Credentials are not here. Same path as GitHub: `secrets` / `loadEnv()`, never the tenants file.
+export type JiraConfig = {
+  baseUrl: string
+  projectKey: string
+  repo: string
+  agentAccountId: string
+  pollIntervalSec: number
+}
+
 export type VibeAgentsIntegrationConfig = {
   endpoint: string
   token?: string
@@ -36,6 +45,7 @@ export type TenantConfig = {
   name: string
   slack?: SlackConfig
   github?: GitHubConfig
+  jira?: JiraConfig
   repos: RepoConfig[]
   defaultRepo?: string
 }
@@ -46,6 +56,8 @@ export type SecretsConfig = {
   githubWebhookSecret?: string
   codexNotifyToken?: string
   vibeAgentsToken?: string
+  jiraEmail?: string
+  jiraApiToken?: string
 }
 
 export type AppConfig = {

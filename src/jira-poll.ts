@@ -1,0 +1,360 @@
+import type { AppConfig, TenantConfig } from "./types.js"
+import type { RunStore } from "./storage.js"
+import { buildJiraBasicAuthHeader } from "./jira-auth.js"
+import { adfToText, type JiraComment, type JiraIssue, type JiraSearchAndReconcileResults } from "./jira-types.js"
+import { logger } from "./logger.js"
+
+export type JiraPollEnv = {
+  jiraEmail?: string
+  jiraApiToken?: string
+}
+
+// LLD §5 declares `harness: Harness`, but harness.ts is a later card and does not
+// exist. This local interface is the stand-in: same role as runService on
+// startGitHubPolling (the poller emits events, it does not own sessions).
+// jira-poll must not import session-links or opencode. A missing harness logs.
+export type JiraAssignmentEvent = {
+  source: "jira"
+  tenantId: string
+  issueKey: string
+  issueId: string
+  repo: string
+  repoPath: string
+  title: string
+  assigneeAccountId: string
+}
+
+export type JiraCommentEvent = {
+  source: "jira"
+  tenantId: string
+  issueKey: string
+  issueId: string
+  repo: string
+  repoPath: string
+  commentId: string
+  commentBody: string
+  authorAccountId: string
+  created: string
+}
+
+export type JiraPollHarness = {
+  onAssignmentEvent: (ev: JiraAssignmentEvent) => void | Promise<void>
+  onCommentEvent: (ev: JiraCommentEvent) => void | Promise<void>
+}
+
+const OVERLAP_MS = 60_000
+const SEARCH_FIELDS = ["assignee", "comment", "status", "summary", "updated"]
+const MAX_SEARCH_PAGES = 20
+
+export function jiraPollIntervalMs(intervalSec: number): number {
+  return Math.max(10000, intervalSec * 1000)
+}
+
+// JQL `updated` literals are minute precision and evaluated in the searching
+// user's timezone, not UTC. Source: https://support.atlassian.com/jira-software-cloud/docs/jql-fields/
+// ("Updated" field; formats "yyyy-MM-dd HH:mm" / "yyyy/MM/dd HH:mm"; "search results
+// will be relative to your configured time zone"). We format UTC. A timezone offset
+// on the API user is unconfirmed without a live site; the 60s overlap does not cover
+// that. Dedupe is the other half of LLD review finding #8.
+export function formatJqlUpdated(date: Date): string {
+  const y = date.getUTCFullYear()
+  const m = String(date.getUTCMonth() + 1).padStart(2, "0")
+  const d = String(date.getUTCDate()).padStart(2, "0")
+  const hh = String(date.getUTCHours()).padStart(2, "0")
+  const mm = String(date.getUTCMinutes()).padStart(2, "0")
+  return `${y}-${m}-${d} ${hh}:${mm}`
+}
+
+export function startJiraPolling(params: {
+  config: AppConfig
+  store: RunStore
+  harness?: JiraPollHarness
+  env: JiraPollEnv
+  now?: () => Date
+}) {
+  const loop = createJiraPollLoop(params)
+  if (!loop) return
+
+  const timer = setInterval(() => {
+    loop.tick().catch(error => logger.error(error, "Jira polling tick failed"))
+  }, loop.intervalMs)
+
+  loop.tick().catch(error => logger.error(error, "Jira polling tick failed"))
+
+  return () => clearInterval(timer)
+}
+
+export function createJiraPollLoop(params: {
+  config: AppConfig
+  store: RunStore
+  harness?: JiraPollHarness
+  env: JiraPollEnv
+  now?: () => Date
+}) {
+  const jiraTenants = params.config.tenants.filter(tenant => tenant.jira)
+  if (jiraTenants.length === 0) return null
+  if (!params.env.jiraEmail || !params.env.jiraApiToken) {
+    logger.warn("Jira polling disabled: missing JIRA_EMAIL or JIRA_API_TOKEN")
+    return null
+  }
+
+  const intervalMs = Math.min(...jiraTenants.map(tenant => jiraPollIntervalMs(tenant.jira!.pollIntervalSec)))
+  const now = params.now ?? (() => new Date())
+  const harness = params.harness ?? stubHarness()
+  const authHeader = buildJiraBasicAuthHeader(params.env.jiraEmail, params.env.jiraApiToken)
+  // jira_seen_comment is deferred (LLD §5). This map dies on process restart, so the
+  // 60s overlap can re-emit a comment or bootstrap after a restart. Acceptable until
+  // that table exists; do not invent session_link here.
+  const seenBootstrap = new Set<string>()
+  const seenComments = new Set<string>()
+  let running = false
+
+  const tick = async () => {
+    if (running) return
+    running = true
+    try {
+      for (const tenant of params.config.tenants) {
+        if (!tenant.jira) continue
+        try {
+          await pollTenant({
+            tenant,
+            store: params.store,
+            harness,
+            authHeader,
+            now,
+            seenBootstrap,
+            seenComments
+          })
+        } catch (error) {
+          logger.error({ err: error, tenantId: tenant.id }, "Jira polling failed")
+        }
+      }
+    } finally {
+      running = false
+    }
+  }
+
+  return { tick, intervalMs }
+}
+
+function stubHarness(): JiraPollHarness {
+  return {
+    onAssignmentEvent(ev) {
+      logger.info({ tenantId: ev.tenantId, issueKey: ev.issueKey }, "jira assignment event (no harness)")
+    },
+    onCommentEvent(ev) {
+      logger.info({ tenantId: ev.tenantId, issueKey: ev.issueKey, commentId: ev.commentId }, "jira comment event (no harness)")
+    }
+  }
+}
+
+async function pollTenant(input: {
+  tenant: TenantConfig
+  store: RunStore
+  harness: JiraPollHarness
+  authHeader: string
+  now: () => Date
+  seenBootstrap: Set<string>
+  seenComments: Set<string>
+}) {
+  const jira = input.tenant.jira
+  if (!jira) return
+  if (!/^[A-Z][A-Z0-9_]+$/.test(jira.projectKey)) {
+    throw new Error(`Invalid Jira project key: ${jira.projectKey}`)
+  }
+  const repo = input.tenant.repos.find(item => item.fullName === jira.repo)
+  if (!repo) {
+    throw new Error(`Jira repo ${jira.repo} is not in tenant ${input.tenant.id} repos`)
+  }
+
+  const state = await input.store.getJiraPollState(input.tenant.id)
+  const nowIso = input.now().toISOString()
+  const cursor = state?.lastCursor ?? nowIso
+  const cursorMs = Date.parse(cursor)
+  const lowerBound = new Date((Number.isFinite(cursorMs) ? cursorMs : Date.parse(nowIso)) - OVERLAP_MS)
+  const jql = `project = ${jira.projectKey} AND updated >= "${formatJqlUpdated(lowerBound)}" ORDER BY updated ASC`
+
+  const issues = await searchJiraIssues({
+    baseUrl: jira.baseUrl,
+    authHeader: input.authHeader,
+    jql
+  })
+
+  let newestMs = Number.isFinite(cursorMs) ? cursorMs : Date.parse(nowIso)
+  let newestRaw = cursor
+
+  for (const issue of issues) {
+    const updatedMs = issue.fields?.updated ? Date.parse(issue.fields.updated) : NaN
+    if (Number.isFinite(updatedMs) && updatedMs >= newestMs) {
+      newestMs = updatedMs
+      newestRaw = issue.fields!.updated!
+    }
+
+    const assigneeId = issue.fields?.assignee?.accountId
+    const bootstrapKey = `${input.tenant.id}:${issue.key}`
+    if (assigneeId && assigneeId === jira.agentAccountId && !input.seenBootstrap.has(bootstrapKey)) {
+      await input.harness.onAssignmentEvent({
+        source: "jira",
+        tenantId: input.tenant.id,
+        issueKey: issue.key,
+        issueId: issue.id,
+        repo: jira.repo,
+        repoPath: repo.path,
+        title: issue.fields?.summary ?? issue.key,
+        assigneeAccountId: assigneeId
+      })
+      input.seenBootstrap.add(bootstrapKey)
+    }
+
+    const comments = await loadComments({
+      baseUrl: jira.baseUrl,
+      authHeader: input.authHeader,
+      issue
+    })
+    const ordered = comments
+      .filter(comment => comment.id && comment.created)
+      .sort((a, b) => {
+        const delta = Date.parse(a.created!) - Date.parse(b.created!)
+        if (delta !== 0) return delta
+        return String(a.id).localeCompare(String(b.id))
+      })
+
+    for (const comment of ordered) {
+      const authorId = comment.author?.accountId ?? ""
+      if (authorId === jira.agentAccountId) continue
+      const createdMs = Date.parse(comment.created!)
+      if (!Number.isFinite(createdMs) || createdMs < lowerBound.getTime()) continue
+      const seenKey = `${input.tenant.id}:${issue.key}:${comment.id}`
+      if (input.seenComments.has(seenKey)) continue
+      await input.harness.onCommentEvent({
+        source: "jira",
+        tenantId: input.tenant.id,
+        issueKey: issue.key,
+        issueId: issue.id,
+        repo: jira.repo,
+        repoPath: repo.path,
+        commentId: comment.id!,
+        commentBody: adfToText(comment.body),
+        authorAccountId: authorId,
+        created: comment.created!
+      })
+      input.seenComments.add(seenKey)
+    }
+  }
+
+  // High-water mark. Overlap re-returns older `updated` values; persisting those
+  // would walk the cursor backward. nextPageToken is never stored here.
+  if (!state || newestRaw !== state.lastCursor) {
+    await input.store.updateJiraPollState({
+      tenantId: input.tenant.id,
+      lastCursor: newestRaw
+    })
+  }
+}
+
+// Verified 2026-09-25 from
+// https://dac-static.atlassian.com/cloud/jira/platform/swagger-v3.v3.json
+// path /rest/api/3/search/jql (info.version 1001.0.0-SNAPSHOT):
+// - GET and POST are both current (not deprecated). GET query params: jql,
+//   nextPageToken, maxResults, fields, expand, properties, fieldsByKeys,
+//   failFast, reconcileIssues, includeArchivedProjects.
+// - POST body is SearchAndReconcileRequestBean (jql, fields[], nextPageToken,
+//   maxResults, ...). We POST so `fields` stays a JSON array and the page token
+//   stays in the body. GET's description says to use POST when JQL is too large
+//   to encode as a query parameter.
+// - 200 body is SearchAndReconcileResults: issues[], nextPageToken (null on the
+//   last page; "continuation token to fetch the next page", expires in 7 days),
+//   isLast, plus names/schema/warnings. warnings is marked experimental.
+// - Old /rest/api/3/search GET and POST are deprecated in the same spec.
+// Not confirmed against a live Jira site (no credentials in this repo).
+export async function searchJiraIssues(input: {
+  baseUrl: string
+  authHeader: string
+  jql: string
+}): Promise<JiraIssue[]> {
+  const issues: JiraIssue[] = []
+  let nextPageToken: string | undefined
+  const seenTokens = new Set<string>()
+
+  for (let page = 0; page < MAX_SEARCH_PAGES; page += 1) {
+    const body: Record<string, unknown> = {
+      jql: input.jql,
+      fields: SEARCH_FIELDS,
+      maxResults: 50
+    }
+    if (nextPageToken) body.nextPageToken = nextPageToken
+
+    const response = await fetch(searchUrl(input.baseUrl), {
+      method: "POST",
+      headers: {
+        authorization: input.authHeader,
+        accept: "application/json",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify(body)
+    })
+    if (!response.ok) {
+      const detail = await response.text()
+      throw new Error(`Jira search failed (${response.status}): ${detail.slice(0, 300)}`)
+    }
+    const payload = await response.json() as JiraSearchAndReconcileResults
+    if (Array.isArray(payload.issues)) issues.push(...payload.issues)
+
+    const token = payload.nextPageToken
+    if (!token || payload.isLast === true) break
+    if (seenTokens.has(token)) {
+      throw new Error("Jira search repeated nextPageToken; refusing to loop")
+    }
+    seenTokens.add(token)
+    nextPageToken = token
+  }
+
+  return issues
+}
+
+async function loadComments(input: {
+  baseUrl: string
+  authHeader: string
+  issue: JiraIssue
+}): Promise<JiraComment[]> {
+  const page = input.issue.fields?.comment
+  const embedded = page?.comments ?? []
+  // The search schema does not say how many comments `fields: ["comment"]` embeds.
+  // PageOfComments.total is the documented count. If the embedded page is short,
+  // page the issue comment resource (GET /rest/api/3/issue/{issueIdOrKey}/comment).
+  if (page?.total == null || embedded.length >= page.total) return embedded
+
+  const comments: JiraComment[] = []
+  let startAt = 0
+  const maxResults = 100
+  for (let pageNo = 0; pageNo < MAX_SEARCH_PAGES; pageNo += 1) {
+    const url = new URL(`/rest/api/3/issue/${encodeURIComponent(input.issue.key)}/comment`, stripSlash(input.baseUrl))
+    url.searchParams.set("startAt", String(startAt))
+    url.searchParams.set("maxResults", String(maxResults))
+    url.searchParams.set("orderBy", "created")
+    const response = await fetch(url, {
+      headers: {
+        authorization: input.authHeader,
+        accept: "application/json"
+      }
+    })
+    if (!response.ok) {
+      const detail = await response.text()
+      throw new Error(`Jira comments failed (${response.status}): ${detail.slice(0, 300)}`)
+    }
+    const payload = await response.json() as { comments?: JiraComment[]; total?: number }
+    const batch = payload.comments ?? []
+    comments.push(...batch)
+    startAt += batch.length
+    if (batch.length === 0 || (payload.total != null && startAt >= payload.total)) break
+  }
+  return comments
+}
+
+function searchUrl(baseUrl: string): string {
+  return `${stripSlash(baseUrl)}/rest/api/3/search/jql`
+}
+
+function stripSlash(baseUrl: string): string {
+  return baseUrl.replace(/\/+$/, "")
+}
