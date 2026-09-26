@@ -45,6 +45,7 @@ export type RunStore = {
   claimSessionLinkKey: (input: ClaimSessionLinkInput) => Promise<SessionLinkClaim>
   promoteSessionLinkClaim: (input: PromoteSessionLinkInput) => Promise<SessionLink>
   resolveSessionLink: (input: ResolveSessionLinkInput) => Promise<SessionLinkResolution>
+  abandonSessionLinkClaim: (input: AbandonSessionLinkClaimInput) => Promise<void>
   getJiraPollState: (tenantId: string) => Promise<{ lastCursor: string; updatedAt: string } | null>
   updateJiraPollState: (input: { tenantId: string; lastCursor: string }) => Promise<void>
   close?: () => Promise<void>
@@ -576,6 +577,11 @@ export type ResolveSessionLinkInput = {
   keys: SessionLinkKeyInput[]
 }
 
+export type AbandonSessionLinkClaimInput = {
+  tenantId: string
+  linkId: string
+}
+
 export type SessionLinkResolution =
   | { state: "linked"; link: SessionLink }
   | { state: "pending"; linkId: string; createdAt: string }
@@ -681,6 +687,7 @@ function createHarnessStorage(sql: Sql, style: SqlStyle, serialize = false) {
     claimSessionLinkKey: (input: ClaimSessionLinkInput) => exclusive(() => claimSessionLinkKey(sql, style, input)),
     promoteSessionLinkClaim: (input: PromoteSessionLinkInput) => exclusive(() => promoteSessionLinkClaim(sql, style, input)),
     resolveSessionLink: (input: ResolveSessionLinkInput) => exclusive(() => resolveSessionLink(sql, style, input)),
+    abandonSessionLinkClaim: (input: AbandonSessionLinkClaimInput) => exclusive(() => abandonSessionLinkClaim(sql, style, input)),
     getJiraPollState: (tenantId: string) => exclusive(() => getJiraPollState(sql, style, tenantId)),
     updateJiraPollState: (input: { tenantId: string; lastCursor: string }) => exclusive(() => updateJiraPollState(sql, style, input))
   }
@@ -950,6 +957,21 @@ async function loadMatches(sql: Sql, style: SqlStyle, tenantId: string, keys: No
     keyCreatedAt: asTimestamp(row.key_created_at),
     link: row.session_id == null ? null : toSessionLink(row)
   }))
+}
+
+async function abandonSessionLinkClaim(sql: Sql, style: SqlStyle, input: AbandonSessionLinkClaimInput): Promise<void> {
+  const tenantId = requireText("tenantId", input.tenantId)
+  const linkId = requireText("linkId", input.linkId)
+  // Immediate abandon of an unpromoted claim (LLD §2 step 4). Same NOT EXISTS
+  // guard as deleteKeyRow: a promoted session_link keeps its key rows. Age is
+  // irrelevant — a failed createSession must not wait out the orphan timeout.
+  await sql.run(
+    `DELETE FROM session_link_key
+     WHERE tenant_id = ${placeholder(style, 1)}
+       AND link_id = ${placeholder(style, 2)}
+       AND NOT EXISTS (SELECT 1 FROM session_link s WHERE s.id = session_link_key.link_id)`,
+    [tenantId, linkId]
+  )
 }
 
 async function deleteKeyRow(sql: Sql, style: SqlStyle, tenantId: string, row: KeyMatch): Promise<number> {
