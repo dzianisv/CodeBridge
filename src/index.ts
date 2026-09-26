@@ -10,7 +10,7 @@ import { createGitHubApp } from "./github.js"
 import { resolveRepo, ensureRepoPath } from "./repo.js"
 import { logger } from "./logger.js"
 import { startGitHubPolling } from "./github-poll.js"
-import { startJiraPolling } from "./jira-poll.js"
+import { createHarnessBackedJiraPoller, startJiraPolling } from "./jira-poll.js"
 import { createCodexNotifyHandler } from "./codex-notify.js"
 import type { AppConfig } from "./types.js"
 import { createVibeAgentsSink } from "./vibe-agents.js"
@@ -136,10 +136,12 @@ const main = async () => {
       }
     })
 
-    // No harness yet (separate card). jira-poll logs events until harness.ts exists.
+    // Linked Jira events go to harness.ts. github-poll.ts still calls
+    // run-service directly (LLD step 6, not this card).
     startJiraPolling({
       config,
       store,
+      harness: createHarnessBackedJiraPoller({ store, config }),
       env: {
         jiraEmail: secrets.jiraEmail,
         jiraApiToken: secrets.jiraApiToken

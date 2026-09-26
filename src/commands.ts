@@ -124,8 +124,22 @@ export function extractRepoHint(text: string): string | null {
   return `${match[1]}/${match[2]}`
 }
 
+const GH_ISSUE_URL = /github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)/i
+const GH_PR_URL = /github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/i
+const SCOPED_ISSUE_REF = /\b([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)#(\d+)\b/
+const JIRA_KEY = /[A-Za-z][A-Za-z0-9]+-\d+/
+
+// Explicit link hints (LLD §3 step 1). `gh:` and `owner/repo#N` do not say
+// issue vs PR — same limitation as parseScopedIssueRef — so those come back
+// as kind "gh". URL forms are specific. harness.ts must not reparse this.
+export type LinkHint =
+  | { kind: "jira"; issueKey: string }
+  | { kind: "gh_issue"; repo: string; number: number }
+  | { kind: "gh_pr"; repo: string; number: number }
+  | { kind: "gh"; repo: string; number: number }
+
 export function parseIssueUrl(text: string): GitHubContext | null {
-  const match = text.match(/github\.com\/([^\/]+)\/([^\/]+)\/issues\/(\d+)/i)
+  const match = text.match(GH_ISSUE_URL)
   if (!match) return null
   return {
     owner: match[1],
@@ -135,7 +149,7 @@ export function parseIssueUrl(text: string): GitHubContext | null {
 }
 
 export function parsePrUrl(text: string): GitHubContext | null {
-  const match = text.match(/github\.com\/([^\/]+)\/([^\/]+)\/pull\/(\d+)/i)
+  const match = text.match(GH_PR_URL)
   if (!match) return null
   return {
     owner: match[1],
@@ -145,13 +159,76 @@ export function parsePrUrl(text: string): GitHubContext | null {
 }
 
 function parseScopedIssueRef(text: string): GitHubContext | null {
-  const match = text.match(/\b([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)#(\d+)\b/)
+  const match = text.match(SCOPED_ISSUE_REF)
   if (!match) return null
   return {
     owner: match[1],
     repo: match[2],
     issueNumber: parseInt(match[3], 10)
   }
+}
+
+export function extractLinkHints(text: string): LinkHint[] {
+  const hints: LinkHint[] = []
+  for (const match of text.matchAll(new RegExp(GH_PR_URL.source, "gi"))) {
+    hints.push({ kind: "gh_pr", repo: `${match[1]}/${match[2]}`, number: parseInt(match[3], 10) })
+  }
+  for (const match of text.matchAll(new RegExp(GH_ISSUE_URL.source, "gi"))) {
+    hints.push({ kind: "gh_issue", repo: `${match[1]}/${match[2]}`, number: parseInt(match[3], 10) })
+  }
+  for (const match of text.matchAll(new RegExp(`(?:^|\\s)jira\\s*[:=]\\s*(${JIRA_KEY.source})\\b`, "gi"))) {
+    hints.push({ kind: "jira", issueKey: match[1] })
+  }
+  for (const match of text.matchAll(new RegExp(`\\/browse\\/(${JIRA_KEY.source})\\b`, "gi"))) {
+    hints.push({ kind: "jira", issueKey: match[1] })
+  }
+  // Reuse parseScopedIssueRef for the token after `gh:` so owner/repo#N is not
+  // a second parser. The nested capture groups in SCOPED_ISSUE_REF are not the
+  // outer match[1], which is why this walks the suffix instead.
+  for (const match of text.matchAll(/(?:^|\s)gh\s*[:=]\s*(\S+)/gi)) {
+    const scoped = parseScopedIssueRef(match[1])
+    if (!scoped?.issueNumber) continue
+    hints.push({ kind: "gh", repo: `${scoped.owner}/${scoped.repo}`, number: scoped.issueNumber })
+  }
+  for (const match of text.matchAll(new RegExp(SCOPED_ISSUE_REF.source, "gi"))) {
+    hints.push({ kind: "gh", repo: `${match[1]}/${match[2]}`, number: parseInt(match[3], 10) })
+  }
+  return dedupeHints(hints)
+}
+
+export function jiraKeysFromBranch(branch: string): string[] {
+  const keys: string[] = []
+  for (const match of branch.matchAll(new RegExp(JIRA_KEY.source, "gi"))) {
+    keys.push(match[0])
+  }
+  return [...new Set(keys.map(key => key.toUpperCase()))]
+}
+
+export function extractClosingRefs(text: string, defaultRepo?: string): Array<{ repo: string; number: number }> {
+  const refs: Array<{ repo: string; number: number }> = []
+  for (const match of text.matchAll(/(?:^|\s)(?:closes|fixes|resolves)\s+([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+)#(\d+)\b/gi)) {
+    refs.push({ repo: match[1], number: parseInt(match[2], 10) })
+  }
+  if (defaultRepo) {
+    for (const match of text.matchAll(/(?:^|\s)(?:closes|fixes|resolves)\s+#(\d+)\b/gi)) {
+      refs.push({ repo: defaultRepo, number: parseInt(match[1], 10) })
+    }
+  }
+  return refs
+}
+
+function dedupeHints(hints: LinkHint[]): LinkHint[] {
+  const seen = new Set<string>()
+  const out: LinkHint[] = []
+  for (const hint of hints) {
+    const id = hint.kind === "jira"
+      ? `jira:${hint.issueKey.toLowerCase()}`
+      : `${hint.kind}:${hint.repo.toLowerCase()}#${hint.number}`
+    if (seen.has(id)) continue
+    seen.add(id)
+    out.push(hint)
+  }
+  return out
 }
 
 function parseLocalIssueRef(text: string): number | null {
