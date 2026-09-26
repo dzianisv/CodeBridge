@@ -19,6 +19,12 @@ export type JiraConfig = {
   pollIntervalSec: number
 }
 
+// LLD §7. Write-back (mirrorReplies) is decided here; harness.ts does not post it.
+export type HarnessConfig = {
+  mirrorReplies?: "origin-only" | "all"
+  reactivationWindowMinutes?: number
+}
+
 export type VibeAgentsIntegrationConfig = {
   endpoint: string
   token?: string
@@ -46,6 +52,7 @@ export type TenantConfig = {
   slack?: SlackConfig
   github?: GitHubConfig
   jira?: JiraConfig
+  harness?: HarnessConfig
   repos: RepoConfig[]
   defaultRepo?: string
 }

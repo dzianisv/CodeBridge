@@ -1,18 +1,20 @@
 import type { AppConfig, TenantConfig } from "./types.js"
-import type { RunStore } from "./storage.js"
+import { SessionLinkResolveConflictError, type RunStore } from "./storage.js"
 import { buildJiraBasicAuthHeader } from "./jira-auth.js"
 import { adfToText, type JiraComment, type JiraIssue, type JiraSearchAndReconcileResults } from "./jira-types.js"
 import { logger } from "./logger.js"
+import { handleAssignmentEvent, handleCommentEvent, type HarnessCtx } from "./harness.js"
 
 export type JiraPollEnv = {
   jiraEmail?: string
   jiraApiToken?: string
 }
 
-// LLD §5 declares `harness: Harness`, but harness.ts is a later card and does not
-// exist. This local interface is the stand-in: same role as runService on
-// startGitHubPolling (the poller emits events, it does not own sessions).
-// jira-poll must not import session-links or opencode. A missing harness logs.
+// Kept as a callback interface so jira-poll unit tests can inject a collector
+// without booting opencode. Production (and a missing harness argument) uses
+// createHarnessBackedJiraPoller, which calls handleAssignmentEvent /
+// handleCommentEvent. The poller still does not import session-links or
+// opencode directly. github-poll.ts is not wired here (LLD step 6, later card).
 export type JiraAssignmentEvent = {
   source: "jira"
   tenantId: string
@@ -101,7 +103,11 @@ export function createJiraPollLoop(params: {
 
   const intervalMs = Math.min(...jiraTenants.map(tenant => jiraPollIntervalMs(tenant.jira!.pollIntervalSec)))
   const now = params.now ?? (() => new Date())
-  const harness = params.harness ?? stubHarness()
+  const harness = params.harness ?? createHarnessBackedJiraPoller({
+    store: params.store,
+    config: params.config,
+    now: params.now
+  })
   const authHeader = buildJiraBasicAuthHeader(params.env.jiraEmail, params.env.jiraApiToken)
   // jira_seen_comment is deferred (LLD §5). This map dies on process restart, so the
   // 60s overlap can re-emit a comment or bootstrap after a restart. Acceptable until
@@ -138,13 +144,49 @@ export function createJiraPollLoop(params: {
   return { tick, intervalMs }
 }
 
-function stubHarness(): JiraPollHarness {
+// Adapter, not a second event model. JiraAssignmentEvent stays what the poller
+// already emits; harness.ts wants LinkKey[]. Conflict is permanent (do not
+// retry the tick). Pending claims and opencode failures still throw so the
+// poller does not mark the event seen.
+export function createHarnessBackedJiraPoller(ctx: HarnessCtx): JiraPollHarness {
   return {
-    onAssignmentEvent(ev) {
-      logger.info({ tenantId: ev.tenantId, issueKey: ev.issueKey }, "jira assignment event (no harness)")
+    async onAssignmentEvent(ev) {
+      try {
+        await handleAssignmentEvent(ctx, {
+          source: "jira",
+          tenantId: ev.tenantId,
+          keys: [{ kind: "jira", issueKey: ev.issueKey }],
+          repoPath: ev.repoPath,
+          title: ev.title
+        })
+      } catch (error) {
+        if (error instanceof SessionLinkResolveConflictError) {
+          logger.warn({ err: error, tenantId: ev.tenantId, issueKey: ev.issueKey }, "jira assignment conflict; not routing")
+          return
+        }
+        throw error
+      }
     },
-    onCommentEvent(ev) {
-      logger.info({ tenantId: ev.tenantId, issueKey: ev.issueKey, commentId: ev.commentId }, "jira comment event (no harness)")
+    async onCommentEvent(ev) {
+      const tenant = ctx.config.tenants.find(item => item.id === ev.tenantId)
+      const authorIsBot = Boolean(tenant?.jira?.agentAccountId && ev.authorAccountId === tenant.jira.agentAccountId)
+      try {
+        await handleCommentEvent(ctx, {
+          source: "jira",
+          tenantId: ev.tenantId,
+          keys: [{ kind: "jira", issueKey: ev.issueKey }],
+          repoPath: ev.repoPath,
+          commentBody: ev.commentBody,
+          authorIsBot,
+          title: ev.issueKey
+        })
+      } catch (error) {
+        if (error instanceof SessionLinkResolveConflictError) {
+          logger.warn({ err: error, tenantId: ev.tenantId, issueKey: ev.issueKey }, "jira comment conflict; not routing")
+          return
+        }
+        throw error
+      }
     }
   }
 }

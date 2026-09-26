@@ -29,6 +29,10 @@ tenants:
         - "codex:"
         - "/codex"
         - "@codex"
+    # Optional. Defaults: mirrorReplies origin-only, reactivationWindowMinutes 60.
+    # harness:
+    #   mirrorReplies: "origin-only"
+    #   reactivationWindowMinutes: 60
     # Optional. Omit to leave Jira polling off. Email/token stay in secrets or env, not here.
     # jira:
     #   baseUrl: "https://yourorg.atlassian.net"

@@ -46,6 +46,7 @@ export type RunStore = {
   promoteSessionLinkClaim: (input: PromoteSessionLinkInput) => Promise<SessionLink>
   resolveSessionLink: (input: ResolveSessionLinkInput) => Promise<SessionLinkResolution>
   abandonSessionLinkClaim: (input: AbandonSessionLinkClaimInput) => Promise<void>
+  updateSessionLinkStatus: (input: UpdateSessionLinkStatusInput) => Promise<SessionLink>
   getJiraPollState: (tenantId: string) => Promise<{ lastCursor: string; updatedAt: string } | null>
   updateJiraPollState: (input: { tenantId: string; lastCursor: string }) => Promise<void>
   close?: () => Promise<void>
@@ -582,6 +583,13 @@ export type AbandonSessionLinkClaimInput = {
   linkId: string
 }
 
+export type UpdateSessionLinkStatusInput = {
+  tenantId: string
+  linkId: string
+  status: SessionLinkStatus
+  updatedAt: string
+}
+
 export type SessionLinkResolution =
   | { state: "linked"; link: SessionLink }
   | { state: "pending"; linkId: string; createdAt: string }
@@ -688,6 +696,7 @@ function createHarnessStorage(sql: Sql, style: SqlStyle, serialize = false) {
     promoteSessionLinkClaim: (input: PromoteSessionLinkInput) => exclusive(() => promoteSessionLinkClaim(sql, style, input)),
     resolveSessionLink: (input: ResolveSessionLinkInput) => exclusive(() => resolveSessionLink(sql, style, input)),
     abandonSessionLinkClaim: (input: AbandonSessionLinkClaimInput) => exclusive(() => abandonSessionLinkClaim(sql, style, input)),
+    updateSessionLinkStatus: (input: UpdateSessionLinkStatusInput) => exclusive(() => updateSessionLinkStatus(sql, style, input)),
     getJiraPollState: (tenantId: string) => exclusive(() => getJiraPollState(sql, style, tenantId)),
     updateJiraPollState: (input: { tenantId: string; lastCursor: string }) => exclusive(() => updateJiraPollState(sql, style, input))
   }
@@ -972,6 +981,28 @@ async function abandonSessionLinkClaim(sql: Sql, style: SqlStyle, input: Abandon
        AND NOT EXISTS (SELECT 1 FROM session_link s WHERE s.id = session_link_key.link_id)`,
     [tenantId, linkId]
   )
+}
+
+// harness.ts reactivation (§6 step 4) and comment routing (§6 step 6) need to
+// flip status and updated_at. Neither existed on RunStore; this is that writer.
+async function updateSessionLinkStatus(sql: Sql, style: SqlStyle, input: UpdateSessionLinkStatusInput): Promise<SessionLink> {
+  const tenantId = requireText("tenantId", input.tenantId)
+  const linkId = requireText("linkId", input.linkId)
+  const updatedAt = requireText("updatedAt", input.updatedAt)
+  if (!SESSION_LINK_STATUSES.has(input.status)) {
+    throw new Error(`invalid session link status: ${input.status}`)
+  }
+  const rows = await sql.all(
+    `UPDATE session_link
+     SET status = ${placeholder(style, 1)}, updated_at = ${placeholder(style, 2)}
+     WHERE id = ${placeholder(style, 3)} AND tenant_id = ${placeholder(style, 4)}
+     RETURNING id, tenant_id, opencode_session_id, status, created_at, updated_at`,
+    [input.status, updatedAt, linkId, tenantId]
+  )
+  if (rows.length === 0) {
+    throw new Error(`cannot update session link ${linkId}: no row for this tenant`)
+  }
+  return toSessionLink(rows[0])
 }
 
 async function deleteKeyRow(sql: Sql, style: SqlStyle, tenantId: string, row: KeyMatch): Promise<number> {

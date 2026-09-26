@@ -37,12 +37,20 @@ const jiraSchema = z.object({
   pollIntervalSec: z.number().int().positive()
 })
 
+// Same optional-block pattern as `jira`: omit the block and polling/routing
+// keeps the LLD §7 defaults (origin-only, 60 minutes).
+const harnessSchema = z.object({
+  mirrorReplies: z.enum(["origin-only", "all"]).optional(),
+  reactivationWindowMinutes: z.number().int().positive().optional()
+})
+
 const tenantSchema = z.object({
   id: z.string(),
   name: z.string(),
   slack: slackSchema.optional(),
   github: githubSchema.optional(),
   jira: jiraSchema.optional(),
+  harness: harnessSchema.optional(),
   repos: z.array(repoSchema),
   defaultRepo: z.string().optional()
 })
