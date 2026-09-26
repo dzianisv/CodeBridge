@@ -50,12 +50,13 @@ export function jiraPollIntervalMs(intervalSec: number): number {
   return Math.max(10000, intervalSec * 1000)
 }
 
-// JQL `updated` literals are minute precision and evaluated in the searching
-// user's timezone, not UTC. Source: https://support.atlassian.com/jira-software-cloud/docs/jql-fields/
-// ("Updated" field; formats "yyyy-MM-dd HH:mm" / "yyyy/MM/dd HH:mm"; "search results
-// will be relative to your configured time zone"). We format UTC. A timezone offset
-// on the API user is unconfirmed without a live site; the 60s overlap does not cover
-// that. Dedupe is the other half of LLD review finding #8.
+// JQL `updated` literals are minute precision. Accepted formats are
+// "yyyy-MM-dd HH:mm", "yyyy/MM/dd HH:mm", "yyyy-MM-dd", "yyyy/MM/dd".
+// Source: https://support.atlassian.com/jira-software-cloud/docs/jql-fields/
+// (Updated field, fetched 2026-09-25): results are "relative to your configured
+// time zone (which is by default the Jira server's time zone)". We format UTC.
+// That default is unconfirmed without a live site; the 60s overlap does not cover
+// a multi-hour offset. Dedupe is the other half of LLD review finding #8.
 export function formatJqlUpdated(date: Date): string {
   const y = date.getUTCFullYear()
   const m = String(date.getUTCMonth() + 1).padStart(2, "0")
@@ -254,18 +255,23 @@ async function pollTenant(input: {
 
 // Verified 2026-09-25 from
 // https://dac-static.atlassian.com/cloud/jira/platform/swagger-v3.v3.json
-// path /rest/api/3/search/jql (info.version 1001.0.0-SNAPSHOT):
-// - GET and POST are both current (not deprecated). GET query params: jql,
+// path /rest/api/3/search/jql
+// (info.version 1001.0.0-SNAPSHOT-44cdd07c042959317ed5591bf79dbcd9369f3610):
+// - GET and POST are both current (deprecated: false). GET query params: jql,
 //   nextPageToken, maxResults, fields, expand, properties, fieldsByKeys,
 //   failFast, reconcileIssues, includeArchivedProjects.
 // - POST body is SearchAndReconcileRequestBean (jql, fields[], nextPageToken,
-//   maxResults, ...). We POST so `fields` stays a JSON array and the page token
-//   stays in the body. GET's description says to use POST when JQL is too large
-//   to encode as a query parameter.
+//   maxResults, ...). `fields` defaults to id only, so updated must be requested.
+//   `jql` must be a bounded query; `project = KEY` is the restriction.
+//   We POST so `fields` stays a JSON array and the page token stays in the body.
+//   GET's description says to use POST when JQL is too large to encode as a
+//   query parameter. That sentence links to the deprecated /rest/api/3/search
+//   POST; the non-deprecated POST is this same /search/jql path.
 // - 200 body is SearchAndReconcileResults: issues[], nextPageToken (null on the
 //   last page; "continuation token to fetch the next page", expires in 7 days),
 //   isLast, plus names/schema/warnings. warnings is marked experimental.
-// - Old /rest/api/3/search GET and POST are deprecated in the same spec.
+// - Old /rest/api/3/search GET and POST are deprecated in the same spec
+//   ("Currently being removed").
 // Not confirmed against a live Jira site (no credentials in this repo).
 export async function searchJiraIssues(input: {
   baseUrl: string
@@ -319,10 +325,15 @@ async function loadComments(input: {
 }): Promise<JiraComment[]> {
   const page = input.issue.fields?.comment
   const embedded = page?.comments ?? []
-  // The search schema does not say how many comments `fields: ["comment"]` embeds.
-  // PageOfComments.total is the documented count. If the embedded page is short,
-  // page the issue comment resource (GET /rest/api/3/issue/{issueIdOrKey}/comment).
-  if (page?.total == null || embedded.length >= page.total) return embedded
+  // Unconfirmed: how many comments `fields: ["comment"]` embeds on search.
+  // swagger PageOfComments.total is described as "The number of items returned",
+  // which does not say whether more exist. The GET comment example
+  // (same spec, /rest/api/3/issue/{issueIdOrKey}/comment) uses total as the
+  // collection size when the page holds every comment. We page that resource
+  // when total is missing or greater than the embedded list. A full page whose
+  // total equals the page length can still be truncated; that case is unconfirmed.
+  const embeddedStart = page?.startAt ?? 0
+  if (page?.total != null && embeddedStart === 0 && embedded.length >= page.total) return embedded
 
   const comments: JiraComment[] = []
   let startAt = 0
