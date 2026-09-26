@@ -3,11 +3,13 @@
 // Deviations from the LLD sketch, same style as opencode-session.ts:
 // - createSession is the real adapter: `{ repoPath, title }` plus optional
 //   OpencodeSessionConfig. The doc's one-arg sketch is not the wire API.
-// - §6.2 MCP write-back (post_jira_comment / post_github_comment /
-//   transition_jira_status) is out of scope for this card. These functions
-//   return the reply string the caller would post. They do not open a network
-//   write to Jira or GitHub. mirrorReplies is returned so the caller can fan
-//   out later; this process does not.
+// - §6.2 MCP write-back for GitHub (post_github_comment / transition_jira_status)
+//   is still out of scope for this file. These functions return the reply
+//   string the caller would post; handleAssignmentEvent's Jira caller
+//   (jira-poll.ts's createHarnessBackedJiraPoller) now posts that reply back
+//   to the ticket via postJiraComment. harness.ts itself still opens no
+//   network write -- the caller owns that, so mirrorReplies fan-out for other
+//   channels is unaffected.
 // - SessionLink has no shareUrl column. A reused session therefore uses the
 //   §4 resume-command fallback, not a stored share URL.
 // - A completed link outside the reactivation window cannot be replaced:

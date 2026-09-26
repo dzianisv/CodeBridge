@@ -4,3 +4,4 @@ dist
 .DS_Store
 data/*.db
 config/tenants.yaml
+package-lock.json
