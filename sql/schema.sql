@@ -60,8 +60,43 @@ CREATE TABLE IF NOT EXISTS session_link (
   status TEXT NOT NULL DEFAULT 'active',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
+  -- Harness issue-assignment association. NULL for Jira/PR-only links.
+  -- source_key matches runs.source_key. run_id is the one harness-owned runs
+  -- row (status 'harness', not a Codex status). turn_state is
+  -- pending | in_progress | failed | completed.
+  source_key TEXT,
+  run_id TEXT,
+  turn_state TEXT,
+  turn_error TEXT,
+  -- Client message id recorded before POST /session/{id}/message. OpenCode
+  -- v1.18.32 stores this id but a second POST with the same id appends another
+  -- part; it is not a remote idempotency token.
+  turn_message_id TEXT,
+  turn_prompt TEXT,
   UNIQUE (tenant_id, opencode_session_id),
   UNIQUE (id)
+);
+
+ALTER TABLE session_link ADD COLUMN IF NOT EXISTS source_key TEXT;
+ALTER TABLE session_link ADD COLUMN IF NOT EXISTS run_id TEXT;
+ALTER TABLE session_link ADD COLUMN IF NOT EXISTS turn_state TEXT;
+ALTER TABLE session_link ADD COLUMN IF NOT EXISTS turn_error TEXT;
+ALTER TABLE session_link ADD COLUMN IF NOT EXISTS turn_message_id TEXT;
+ALTER TABLE session_link ADD COLUMN IF NOT EXISTS turn_prompt TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS session_link_source_key_idx ON session_link (source_key);
+CREATE UNIQUE INDEX IF NOT EXISTS session_link_run_id_idx ON session_link (run_id);
+
+-- Poll and webhook can both observe the same GitHub comment. The primary key
+-- is the claim. state is sending | delivered | indeterminate.
+CREATE TABLE IF NOT EXISTS github_comment_delivery (
+  tenant_id TEXT NOT NULL,
+  repo_full_name TEXT NOT NULL,
+  comment_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (tenant_id, repo_full_name, comment_id)
 );
 
 -- repo_key is derived from repo ('' when repo is NULL) so a Jira NULL repo

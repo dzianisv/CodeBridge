@@ -75,6 +75,8 @@ export type CommentEvent = {
   authorIsBot: boolean
   repoPath?: string
   title?: string
+  // Recorded by the caller before POST. Not an OpenCode idempotency token.
+  dispatchMessageId?: string
 }
 
 export type HarnessMirror = "origin-only" | "all"
@@ -214,7 +216,10 @@ export async function handleCommentEvent(ctx: HarnessCtx, ev: CommentEvent): Pro
   const sessionId = linked.opencodeSessionId
   const reply = await withSessionLock(sessionId, async () => {
     try {
-      const turn = await sessionsOf(ctx).appendTurn(sessionId, ev.commentBody, sessionConfig)
+      const turnConfig = ev.dispatchMessageId
+        ? { ...sessionConfig, messageId: ev.dispatchMessageId }
+        : sessionConfig
+      const turn = await sessionsOf(ctx).appendTurn(sessionId, ev.commentBody, turnConfig)
       await ctx.store.updateSessionLinkStatus({
         tenantId: ev.tenantId,
         linkId: linked.id,
@@ -304,6 +309,10 @@ function mentionsAgent(tenant: TenantConfig | undefined, text: string): boolean 
 }
 
 type KeyPlan = { resolveKeys: LinkKey[]; attachKeys: LinkKey[] }
+
+export function planLinkKeys(ev: AssignmentEvent | CommentEvent): KeyPlan {
+  return candidateKeys(ev)
+}
 
 function candidateKeys(ev: AssignmentEvent | CommentEvent): KeyPlan {
   const text = "commentBody" in ev

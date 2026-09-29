@@ -48,7 +48,10 @@ const opencodeSchema = z.object({
 // keeps the LLD §7 defaults (origin-only, 60 minutes).
 const harnessSchema = z.object({
   mirrorReplies: z.enum(["origin-only", "all"]).optional(),
-  reactivationWindowMinutes: z.number().int().positive().optional()
+  reactivationWindowMinutes: z.number().int().positive().optional(),
+  // Opt-in owner/repo list. Empty/omitted does not route issue assignment
+  // away from the Codex runner.
+  issueAssignmentRepos: z.array(z.string().regex(/^[^/\s]+\/[^/\s]+$/)).optional()
 })
 
 const tenantSchema = z.object({

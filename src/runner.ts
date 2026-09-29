@@ -36,6 +36,11 @@ export function createRunner(params: {
   return async (job: { runId: string }) => {
     const run = await store.getRun(job.runId)
     if (!run) throw new Error(`Run not found: ${job.runId}`)
+    // Opt-in issue assignment records a runs row so the assignment is durable,
+    // but that row is not a Codex job. Never flip it to running.
+    if (String(run.status) === "harness") {
+      throw new Error(`refusing Codex worker for harness run ${run.id}`)
+    }
     const discussionTarget = isDiscussionSourceKey(run.sourceKey)
 
     await store.updateRunStatus(run.id, "running")

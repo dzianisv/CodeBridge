@@ -23,6 +23,11 @@ export type OpencodeSessionConfig = {
   // return share on create.
   shareBaseUrl?: string | null
   timeoutMs?: number
+  // Optional client id for POST /session/{id}/message. v1.18.32 stores it as
+  // the user message id. It is NOT an idempotency token: a second POST with
+  // the same id appends another text part onto that message. Callers must
+  // reconcile with getSessionMessage and must not replay after a crash.
+  messageId?: string
 }
 
 export type OpencodeFailureKind = "network" | "http" | "parse"
@@ -60,6 +65,7 @@ type ResolvedConfig = {
   baseUrl: string
   shareBaseUrl: string | null
   timeoutMs: number
+  messageId?: string
 }
 
 export async function createSession(
@@ -98,10 +104,12 @@ export async function appendTurn(
 
   const resolved = resolveConfig(config)
   // There is no `prompt` string field. parts is required.
+  // messageID is a client id, not exactly-once. See OpencodeSessionConfig.
   const response = await opencodeFetch(resolved, `/session/${encodeURIComponent(sessionId)}/message`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
+      ...(resolved.messageId ? { messageID: resolved.messageId } : {}),
       parts: [{ type: "text", text: prompt }]
     })
   })
@@ -115,6 +123,38 @@ export async function appendTurn(
   }
 
   return { reply: extractReplyText(body.parts) }
+}
+
+export type OpencodeMessageLookup =
+  | { found: false }
+  | { found: true; id: string; role: string; texts: string[] }
+
+// GET /session/{id}/message/{messageID}. 404 is not-found, not unreachable.
+// A hit does not mean a second POST is a no-op; it means the id was accepted.
+export async function getSessionMessage(
+  sessionId: string,
+  messageId: string,
+  config?: OpencodeSessionConfig
+): Promise<OpencodeMessageLookup> {
+  if (!sessionId) throw new Error("sessionId is required")
+  if (!messageId) throw new Error("messageId is required")
+  const resolved = resolveConfig(config)
+  const response = await opencodeFetch(
+    resolved,
+    `/session/${encodeURIComponent(sessionId)}/message/${encodeURIComponent(messageId)}`,
+    { method: "GET" }
+  )
+  if (response.status === 404) {
+    await response.text().catch(() => "")
+    return { found: false }
+  }
+  const body = await readJson(response)
+  if (!isRecord(body) || !isRecord(body.info)) {
+    throw new OpencodeUnreachableError("opencode message lookup was not an object", { kind: "parse" })
+  }
+  const id = typeof body.info.id === "string" ? body.info.id : messageId
+  const role = typeof body.info.role === "string" ? body.info.role : ""
+  return { found: true, id, role, texts: textParts(body.parts) }
 }
 
 export async function getSessionStatus(
@@ -177,16 +217,21 @@ function mapStatusEntry(value: unknown): OpencodeSessionStatus {
   throw new OpencodeUnreachableError(`opencode session status type is unrecognized: ${value.type}`, { kind: "parse" })
 }
 
-function extractReplyText(parts: unknown): string {
-  if (!Array.isArray(parts)) {
-    throw new OpencodeUnreachableError("opencode message response missing parts array", { kind: "parse" })
-  }
+function textParts(parts: unknown): string[] {
+  if (!Array.isArray(parts)) return []
   const texts: string[] = []
   for (const part of parts) {
     if (!isRecord(part) || part.type !== "text" || typeof part.text !== "string") continue
     texts.push(part.text)
   }
-  return texts.join("\n")
+  return texts
+}
+
+function extractReplyText(parts: unknown): string {
+  if (!Array.isArray(parts)) {
+    throw new OpencodeUnreachableError("opencode message response missing parts array", { kind: "parse" })
+  }
+  return textParts(parts).join("\n")
 }
 
 function readSessionId(body: unknown): string {
@@ -198,10 +243,12 @@ function readSessionId(body: unknown): string {
 
 function resolveConfig(config: OpencodeSessionConfig | undefined): ResolvedConfig {
   const shareBaseUrl = config?.shareBaseUrl?.trim() ? config.shareBaseUrl.trim() : null
+  const messageId = config?.messageId?.trim() ? config.messageId.trim() : undefined
   return {
     baseUrl: (config?.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, ""),
     shareBaseUrl,
-    timeoutMs: config?.timeoutMs ?? DEFAULT_TIMEOUT_MS
+    timeoutMs: config?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    ...(messageId ? { messageId } : {})
   }
 }
 

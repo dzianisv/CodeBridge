@@ -30,9 +30,15 @@ tenants:
         - "/codex"
         - "@codex"
     # Optional. Defaults: mirrorReplies origin-only, reactivationWindowMinutes 60.
+    # issueAssignmentRepos opts that repo's GitHub issue assignment into the
+    # OpenCode harness. Omit it to keep the Codex assignment path.
+    # Sharing is the opencode block below, not a harness field. It stays off
+    # unless sharingEnabled is true.
     # harness:
     #   mirrorReplies: "origin-only"
     #   reactivationWindowMinutes: 60
+    #   issueAssignmentRepos:
+    #     - "owner/repo"
     # Optional. Default sharingEnabled is false (omit the block for the same
     # result). Do not set shareBaseUrl — it is not a tenant setting. Turn sharing
     # on only if public opencode share links are acceptable for this tenant.

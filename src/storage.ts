@@ -42,11 +42,18 @@ export type RunStore = {
   updateRunBranch: (id: string, branchName: string) => Promise<void>
   updateRunPr: (id: string, prNumber: number, prUrl: string) => Promise<void>
   appendEvent: (event: RunEvent) => Promise<void>
+  insertHarnessRun: (input: InsertHarnessRunInput) => Promise<HarnessRunInsert>
   claimSessionLinkKey: (input: ClaimSessionLinkInput) => Promise<SessionLinkClaim>
   promoteSessionLinkClaim: (input: PromoteSessionLinkInput) => Promise<SessionLink>
   resolveSessionLink: (input: ResolveSessionLinkInput) => Promise<SessionLinkResolution>
   abandonSessionLinkClaim: (input: AbandonSessionLinkClaimInput) => Promise<void>
   updateSessionLinkStatus: (input: UpdateSessionLinkStatusInput) => Promise<SessionLink>
+  bindHarnessRun: (input: BindHarnessRunInput) => Promise<SessionLink>
+  claimIssueTurn: (input: ClaimIssueTurnInput) => Promise<IssueTurnClaim>
+  finishIssueTurn: (input: FinishIssueTurnInput) => Promise<SessionLink>
+  claimCommentDelivery: (input: ClaimCommentDeliveryInput) => Promise<CommentDeliveryClaim>
+  finishCommentDelivery: (input: FinishCommentDeliveryInput) => Promise<void>
+  releaseCommentDelivery: (input: ReleaseCommentDeliveryInput) => Promise<boolean>
   getJiraPollState: (tenantId: string) => Promise<{ lastCursor: string; updatedAt: string } | null>
   updateJiraPollState: (input: { tenantId: string; lastCursor: string }) => Promise<void>
   close?: () => Promise<void>
@@ -196,6 +203,9 @@ export function createPostgresStore(databaseUrl: string): RunStore {
     )
   }
 
+  const insertHarnessRun = (input: InsertHarnessRunInput) =>
+    insertHarnessRunRow(createPostgresSql(pool), "pg", input, toRunRecord)
+
   const harness = createHarnessStorage(createPostgresSql(pool), "pg")
   const close = async () => {
     await pool.end()
@@ -215,6 +225,7 @@ export function createPostgresStore(databaseUrl: string): RunStore {
     updateRunBranch,
     updateRunPr,
     appendEvent,
+    insertHarnessRun,
     close,
     ...harness
   }
@@ -431,6 +442,9 @@ export function createSqliteStore(databaseUrl: string): RunStore {
     insertEventStmt.run(event.runId, event.seq, event.type, JSON.stringify(event.payload))
   }
 
+  const insertHarnessRun = (input: InsertHarnessRunInput) =>
+    insertHarnessRunRow(createSqliteSql(db), "sqlite", input, toRunRecordSqlite)
+
   const harness = createHarnessStorage(createSqliteSql(db), "sqlite", true)
   const close = async () => {
     db.close()
@@ -450,6 +464,7 @@ export function createSqliteStore(databaseUrl: string): RunStore {
     updateRunBranch,
     updateRunPr,
     appendEvent,
+    insertHarnessRun,
     close,
     ...harness
   }
@@ -517,17 +532,134 @@ function toRunRecordSqlite(row: any): RunRecord {
 }
 
 function ensureSqliteRunSchemaMigrations(db: Database.Database) {
-  // session_link, session_link_key, and jira_poll_state are new tables created
-  // by sql/schema.sqlite.sql (CREATE TABLE IF NOT EXISTS), which runs before
-  // this function. No ALTER is required until those tables gain columns.
   const columns = db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>
   if (!columns.some(column => column.name === "source_key")) {
     db.exec("ALTER TABLE runs ADD COLUMN source_key TEXT")
   }
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS runs_source_key_idx ON runs(source_key)")
+
+  const linkColumns = db.prepare("PRAGMA table_info(session_link)").all() as Array<{ name: string }>
+  if (linkColumns.length === 0) return
+  const linkNames = new Set(linkColumns.map(column => column.name))
+  if (!linkNames.has("source_key")) db.exec("ALTER TABLE session_link ADD COLUMN source_key TEXT")
+  if (!linkNames.has("run_id")) db.exec("ALTER TABLE session_link ADD COLUMN run_id TEXT")
+  if (!linkNames.has("turn_state")) db.exec("ALTER TABLE session_link ADD COLUMN turn_state TEXT")
+  if (!linkNames.has("turn_error")) db.exec("ALTER TABLE session_link ADD COLUMN turn_error TEXT")
+  if (!linkNames.has("turn_message_id")) db.exec("ALTER TABLE session_link ADD COLUMN turn_message_id TEXT")
+  if (!linkNames.has("turn_prompt")) db.exec("ALTER TABLE session_link ADD COLUMN turn_prompt TEXT")
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS session_link_source_key_idx ON session_link (source_key)")
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS session_link_run_id_idx ON session_link (run_id)")
+  db.exec(`CREATE TABLE IF NOT EXISTS github_comment_delivery (
+    tenant_id TEXT NOT NULL,
+    repo_full_name TEXT NOT NULL,
+    comment_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, repo_full_name, comment_id)
+  )`)
 }
 
 export type SessionLinkStatus = "active" | "idle" | "completed"
+
+export type IssueTurnState = "pending" | "in_progress" | "failed" | "completed" | "indeterminate"
+
+export const HARNESS_RUN_STATUS = "harness"
+
+export type InsertHarnessRunInput = {
+  id: string
+  tenantId: string
+  repoFullName: string
+  repoPath: string
+  sourceKey: string
+  prompt: string
+  model?: string
+  branchPrefix?: string
+  github?: GitHubContext
+}
+
+export type HarnessRunInsert =
+  | { outcome: "created" | "existing"; run: RunRecord }
+  | { outcome: "conflict"; run: RunRecord }
+
+export type BindHarnessRunInput = {
+  tenantId: string
+  linkId: string
+  runId: string
+  sourceKey: string
+  updatedAt: string
+}
+
+export type ClaimIssueTurnInput = {
+  tenantId: string
+  linkId: string
+  updatedAt: string
+  staleBefore: string
+  messageId: string
+  prompt: string
+}
+
+export type IssueTurnClaim =
+  | { outcome: "claimed"; link: SessionLink }
+  | { outcome: "completed"; link: SessionLink }
+  | { outcome: "busy"; link: SessionLink }
+  | { outcome: "stale"; link: SessionLink }
+  | { outcome: "held"; link: SessionLink }
+
+export type FinishIssueTurnInput = {
+  tenantId: string
+  linkId: string
+  state: "completed" | "failed" | "indeterminate"
+  error?: string
+  updatedAt: string
+  // Only after a finished response proved the remote message is absent.
+  clearDispatch?: boolean
+}
+
+export type ClaimCommentDeliveryInput = {
+  tenantId: string
+  repoFullName: string
+  commentId: string
+  messageId: string
+  updatedAt: string
+}
+
+export type CommentDeliveryClaim =
+  | { outcome: "claimed"; messageId: string }
+  | { outcome: "delivered"; messageId: string }
+  | { outcome: "in_flight"; messageId: string }
+  | { outcome: "indeterminate"; messageId: string }
+
+export type FinishCommentDeliveryInput = {
+  tenantId: string
+  repoFullName: string
+  commentId: string
+  messageId: string
+  state: "delivered" | "indeterminate"
+  updatedAt: string
+}
+
+export type ReleaseCommentDeliveryInput = {
+  tenantId: string
+  repoFullName: string
+  commentId: string
+  messageId: string
+}
+
+export class SessionLinkBindConflictError extends Error {
+  readonly linkId: string
+  readonly runId: string | null
+  readonly sourceKey: string | null
+
+  constructor(linkId: string, runId: string | null, sourceKey: string | null) {
+    super(`session link ${linkId} is already bound to a different harness run`)
+    this.name = "SessionLinkBindConflictError"
+    this.linkId = linkId
+    this.runId = runId
+    this.sourceKey = sourceKey
+  }
+}
 
 export type SessionLinkKeyInput =
   | { kind: "jira"; issueKey: string }
@@ -548,6 +680,12 @@ export type SessionLink = {
   status: SessionLinkStatus
   createdAt: string
   updatedAt: string
+  sourceKey: string | null
+  runId: string | null
+  turnState: IssueTurnState | null
+  turnError: string | null
+  turnMessageId: string | null
+  turnPrompt: string | null
 }
 
 export type SessionLinkClaim = {
@@ -697,6 +835,12 @@ function createHarnessStorage(sql: Sql, style: SqlStyle, serialize = false) {
     resolveSessionLink: (input: ResolveSessionLinkInput) => exclusive(() => resolveSessionLink(sql, style, input)),
     abandonSessionLinkClaim: (input: AbandonSessionLinkClaimInput) => exclusive(() => abandonSessionLinkClaim(sql, style, input)),
     updateSessionLinkStatus: (input: UpdateSessionLinkStatusInput) => exclusive(() => updateSessionLinkStatus(sql, style, input)),
+    bindHarnessRun: (input: BindHarnessRunInput) => exclusive(() => bindHarnessRun(sql, style, input)),
+    claimIssueTurn: (input: ClaimIssueTurnInput) => exclusive(() => claimIssueTurn(sql, style, input)),
+    finishIssueTurn: (input: FinishIssueTurnInput) => exclusive(() => finishIssueTurn(sql, style, input)),
+    claimCommentDelivery: (input: ClaimCommentDeliveryInput) => exclusive(() => claimCommentDelivery(sql, style, input)),
+    finishCommentDelivery: (input: FinishCommentDeliveryInput) => exclusive(() => finishCommentDelivery(sql, style, input)),
+    releaseCommentDelivery: (input: ReleaseCommentDeliveryInput) => exclusive(() => releaseCommentDelivery(sql, style, input)),
     getJiraPollState: (tenantId: string) => exclusive(() => getJiraPollState(sql, style, tenantId)),
     updateJiraPollState: (input: { tenantId: string; lastCursor: string }) => exclusive(() => updateJiraPollState(sql, style, input))
   }
@@ -832,7 +976,7 @@ async function promoteSessionLinkClaim(sql: Sql, style: SqlStyle, input: Promote
     const rows = await sql.all(
       `INSERT INTO session_link (id, tenant_id, opencode_session_id, status, created_at, updated_at)
        VALUES (${placeholders(style, 6)})
-       RETURNING id, tenant_id, opencode_session_id, status, created_at, updated_at`,
+       RETURNING ${SESSION_LINK_COLUMNS}`,
       [linkId, tenantId, opencodeSessionId, status, now, now]
     )
     return toSessionLink(rows[0])
@@ -952,7 +1096,10 @@ async function loadMatches(sql: Sql, style: SqlStyle, tenantId: string, keys: No
   const rows = await sql.all(
     `SELECT k.link_id, k.kind, k.repo_key, k.value, k.created_at AS key_created_at,
             s.id AS session_id, s.tenant_id AS session_tenant_id, s.opencode_session_id,
-            s.status AS session_status, s.created_at AS session_created_at, s.updated_at AS session_updated_at
+            s.status AS session_status, s.created_at AS session_created_at, s.updated_at AS session_updated_at,
+            s.source_key AS session_source_key, s.run_id AS session_run_id,
+            s.turn_state AS session_turn_state, s.turn_error AS session_turn_error,
+            s.turn_message_id AS session_turn_message_id, s.turn_prompt AS session_turn_prompt
      FROM session_link_key k
      LEFT JOIN session_link s ON s.id = k.link_id AND s.tenant_id = k.tenant_id
      WHERE k.tenant_id = ${placeholder(style, 1)} AND (${clauses.join(" OR ")})`,
@@ -996,7 +1143,7 @@ async function updateSessionLinkStatus(sql: Sql, style: SqlStyle, input: UpdateS
     `UPDATE session_link
      SET status = ${placeholder(style, 1)}, updated_at = ${placeholder(style, 2)}
      WHERE id = ${placeholder(style, 3)} AND tenant_id = ${placeholder(style, 4)}
-     RETURNING id, tenant_id, opencode_session_id, status, created_at, updated_at`,
+     RETURNING ${SESSION_LINK_COLUMNS}`,
     [input.status, updatedAt, linkId, tenantId]
   )
   if (rows.length === 0) {
@@ -1069,19 +1216,272 @@ function dedupeKeys(keys: NormalizedSessionLinkKey[]): NormalizedSessionLinkKey[
   return out
 }
 
+const SESSION_LINK_COLUMNS = "id, tenant_id, opencode_session_id, status, created_at, updated_at, source_key, run_id, turn_state, turn_error, turn_message_id, turn_prompt"
+
+const ISSUE_TURN_STATES = new Set<IssueTurnState>(["pending", "in_progress", "failed", "completed", "indeterminate"])
+
 function toSessionLink(row: SqlRow): SessionLink {
   const status = asString(row.session_status ?? row.status)
   if (!SESSION_LINK_STATUSES.has(status as SessionLinkStatus)) {
     throw new Error(`invalid session link status: ${status}`)
   }
+  const turnRaw = row.session_turn_state ?? row.turn_state
+  const turnState = turnRaw == null || turnRaw === "" ? null : asString(turnRaw)
+  if (turnState !== null && !ISSUE_TURN_STATES.has(turnState as IssueTurnState)) {
+    throw new Error(`invalid issue turn state: ${turnState}`)
+  }
+  const sourceKey = row.session_source_key ?? row.source_key
+  const runId = row.session_run_id ?? row.run_id
+  const turnError = row.session_turn_error ?? row.turn_error
+  const turnMessageId = row.session_turn_message_id ?? row.turn_message_id
+  const turnPrompt = row.session_turn_prompt ?? row.turn_prompt
   return {
     id: asString(row.session_id ?? row.id),
     tenantId: asString(row.session_tenant_id ?? row.tenant_id),
     opencodeSessionId: asString(row.opencode_session_id),
     status: status as SessionLinkStatus,
     createdAt: asTimestamp(row.session_created_at ?? row.created_at),
-    updatedAt: asTimestamp(row.session_updated_at ?? row.updated_at)
+    updatedAt: asTimestamp(row.session_updated_at ?? row.updated_at),
+    sourceKey: sourceKey == null ? null : asString(sourceKey),
+    runId: runId == null ? null : asString(runId),
+    turnState: turnState as IssueTurnState | null,
+    turnError: turnError == null ? null : asString(turnError),
+    turnMessageId: turnMessageId == null || turnMessageId === "" ? null : asString(turnMessageId),
+    turnPrompt: turnPrompt == null ? null : asString(turnPrompt)
   }
+}
+
+async function insertHarnessRunRow(
+  sql: Sql,
+  style: SqlStyle,
+  input: InsertHarnessRunInput,
+  toRun: (row: SqlRow) => RunRecord
+): Promise<HarnessRunInsert> {
+  const sourceKey = requireText("sourceKey", input.sourceKey)
+  const existing = await readRunBySourceKey(sql, style, sourceKey, toRun)
+  if (existing) return classifyHarnessRun(existing)
+  try {
+    await sql.run(
+      `INSERT INTO runs (
+        id, tenant_id, repo_full_name, repo_path, source_key, status, prompt, model, branch_prefix,
+        github_owner, github_repo, github_issue_number, github_installation_id, github_issue_title, github_issue_body
+      ) VALUES (${placeholders(style, 15)})`,
+      [
+        requireText("id", input.id),
+        requireText("tenantId", input.tenantId),
+        requireText("repoFullName", input.repoFullName),
+        requireText("repoPath", input.repoPath),
+        sourceKey,
+        HARNESS_RUN_STATUS,
+        input.prompt,
+        input.model ?? null,
+        input.branchPrefix ?? null,
+        input.github?.owner ?? null,
+        input.github?.repo ?? null,
+        input.github?.issueNumber ?? null,
+        input.github?.installationId ?? null,
+        input.github?.issueTitle ?? null,
+        input.github?.issueBody ?? null
+      ]
+    )
+  } catch (error) {
+    if (!isUniqueViolation(error)) throw error
+  }
+  const row = await readRunBySourceKey(sql, style, sourceKey, toRun)
+  if (!row) throw new Error(`harness run insert did not persist source key ${sourceKey}`)
+  return classifyHarnessRun(row, row.id === input.id)
+}
+
+function classifyHarnessRun(run: RunRecord, created = false): HarnessRunInsert {
+  if (String(run.status) !== HARNESS_RUN_STATUS) return { outcome: "conflict", run }
+  return { outcome: created ? "created" : "existing", run }
+}
+
+async function readRunBySourceKey(
+  sql: Sql,
+  style: SqlStyle,
+  sourceKey: string,
+  toRun: (row: SqlRow) => RunRecord
+): Promise<RunRecord | null> {
+  const rows = await sql.all(
+    `SELECT * FROM runs WHERE source_key = ${placeholder(style, 1)}`,
+    [sourceKey]
+  )
+  if (rows.length === 0) return null
+  return toRun(rows[0])
+}
+
+async function bindHarnessRun(sql: Sql, style: SqlStyle, input: BindHarnessRunInput): Promise<SessionLink> {
+  const tenantId = requireText("tenantId", input.tenantId)
+  const linkId = requireText("linkId", input.linkId)
+  const runId = requireText("runId", input.runId)
+  const sourceKey = requireText("sourceKey", input.sourceKey)
+  const updatedAt = requireText("updatedAt", input.updatedAt)
+  const rows = await sql.all(
+    `UPDATE session_link
+     SET run_id = CASE WHEN run_id IS NULL THEN ${placeholder(style, 1)} ELSE run_id END,
+         source_key = CASE WHEN source_key IS NULL THEN ${placeholder(style, 2)} ELSE source_key END,
+         turn_state = CASE WHEN turn_state IS NULL THEN 'pending' ELSE turn_state END,
+         updated_at = CASE
+           WHEN run_id IS NULL OR source_key IS NULL OR turn_state IS NULL THEN ${placeholder(style, 3)}
+           ELSE updated_at
+         END
+     WHERE id = ${placeholder(style, 4)} AND tenant_id = ${placeholder(style, 5)}
+       AND (run_id IS NULL OR run_id = ${placeholder(style, 6)})
+       AND (source_key IS NULL OR source_key = ${placeholder(style, 7)})
+     RETURNING ${SESSION_LINK_COLUMNS}`,
+    [runId, sourceKey, updatedAt, linkId, tenantId, runId, sourceKey]
+  )
+  if (rows.length === 1) return toSessionLink(rows[0])
+  const current = await readSessionLink(sql, style, tenantId, linkId)
+  throw new SessionLinkBindConflictError(linkId, current?.runId ?? null, current?.sourceKey ?? null)
+}
+
+async function claimIssueTurn(sql: Sql, style: SqlStyle, input: ClaimIssueTurnInput): Promise<IssueTurnClaim> {
+  const tenantId = requireText("tenantId", input.tenantId)
+  const linkId = requireText("linkId", input.linkId)
+  const updatedAt = requireText("updatedAt", input.updatedAt)
+  const staleBefore = requireText("staleBefore", input.staleBefore)
+  const messageId = requireText("messageId", input.messageId)
+  const prompt = requireText("prompt", input.prompt)
+  // Stale in_progress is not reclaimed. A lease timeout cannot prove the
+  // remote POST is absent, and v1.18.32 messageID is not exactly-once.
+  const rows = await sql.all(
+    `UPDATE session_link
+     SET turn_state = 'in_progress',
+         turn_error = NULL,
+         turn_message_id = COALESCE(turn_message_id, ${placeholder(style, 1)}),
+         turn_prompt = COALESCE(turn_prompt, ${placeholder(style, 2)}),
+         updated_at = ${placeholder(style, 3)}
+     WHERE id = ${placeholder(style, 4)} AND tenant_id = ${placeholder(style, 5)}
+       AND (
+         turn_state IS NULL
+         OR turn_state = 'pending'
+         OR (turn_state = 'failed' AND turn_message_id IS NULL)
+       )
+     RETURNING ${SESSION_LINK_COLUMNS}`,
+    [messageId, prompt, updatedAt, linkId, tenantId]
+  )
+  if (rows.length === 1) return { outcome: "claimed", link: toSessionLink(rows[0]) }
+  const current = await readSessionLink(sql, style, tenantId, linkId)
+  if (!current) throw new Error(`cannot claim issue turn: no session link ${linkId}`)
+  if (current.turnState === "completed") return { outcome: "completed", link: current }
+  if (current.turnState === "indeterminate") return { outcome: "held", link: current }
+  if (current.turnState === "failed" && current.turnMessageId) return { outcome: "held", link: current }
+  if (current.turnState === "in_progress" && current.updatedAt <= staleBefore) {
+    return { outcome: "stale", link: current }
+  }
+  return { outcome: "busy", link: current }
+}
+
+async function finishIssueTurn(sql: Sql, style: SqlStyle, input: FinishIssueTurnInput): Promise<SessionLink> {
+  const tenantId = requireText("tenantId", input.tenantId)
+  const linkId = requireText("linkId", input.linkId)
+  const updatedAt = requireText("updatedAt", input.updatedAt)
+  if (input.state !== "completed" && input.state !== "failed" && input.state !== "indeterminate") {
+    throw new Error(`invalid issue turn finish state: ${input.state}`)
+  }
+  const clearDispatch = input.clearDispatch === true ? 1 : 0
+  const rows = await sql.all(
+    `UPDATE session_link
+     SET turn_state = ${placeholder(style, 1)},
+         turn_error = ${placeholder(style, 2)},
+         turn_message_id = CASE WHEN ${placeholder(style, 3)} = 1 THEN NULL ELSE turn_message_id END,
+         turn_prompt = CASE WHEN ${placeholder(style, 4)} = 1 THEN NULL ELSE turn_prompt END,
+         updated_at = ${placeholder(style, 5)}
+     WHERE id = ${placeholder(style, 6)} AND tenant_id = ${placeholder(style, 7)} AND turn_state = 'in_progress'
+     RETURNING ${SESSION_LINK_COLUMNS}`,
+    [input.state, input.error ?? null, clearDispatch, clearDispatch, updatedAt, linkId, tenantId]
+  )
+  if (rows.length === 0) {
+    throw new Error(`cannot finish issue turn ${linkId}: claim is not in_progress`)
+  }
+  return toSessionLink(rows[0])
+}
+
+async function claimCommentDelivery(
+  sql: Sql,
+  style: SqlStyle,
+  input: ClaimCommentDeliveryInput
+): Promise<CommentDeliveryClaim> {
+  const tenantId = requireText("tenantId", input.tenantId)
+  const repoFullName = requireText("repoFullName", input.repoFullName).toLowerCase()
+  const commentId = requireText("commentId", input.commentId)
+  const messageId = requireText("messageId", input.messageId)
+  const updatedAt = requireText("updatedAt", input.updatedAt)
+  try {
+    await sql.run(
+      `INSERT INTO github_comment_delivery (
+        tenant_id, repo_full_name, comment_id, message_id, state, created_at, updated_at
+      ) VALUES (${placeholders(style, 7)})`,
+      [tenantId, repoFullName, commentId, messageId, "sending", updatedAt, updatedAt]
+    )
+    return { outcome: "claimed", messageId }
+  } catch (error) {
+    if (!isUniqueViolation(error) && !isPrimaryKeyViolation(error)) throw error
+  }
+  const current = await readCommentDelivery(sql, style, tenantId, repoFullName, commentId)
+  if (!current) throw new Error(`comment delivery ${commentId} insert did not persist`)
+  if (current.state === "delivered") return { outcome: "delivered", messageId: current.messageId }
+  if (current.state === "indeterminate") return { outcome: "indeterminate", messageId: current.messageId }
+  return { outcome: "in_flight", messageId: current.messageId }
+}
+
+async function finishCommentDelivery(sql: Sql, style: SqlStyle, input: FinishCommentDeliveryInput): Promise<void> {
+  const tenantId = requireText("tenantId", input.tenantId)
+  const repoFullName = requireText("repoFullName", input.repoFullName).toLowerCase()
+  const commentId = requireText("commentId", input.commentId)
+  const messageId = requireText("messageId", input.messageId)
+  const updatedAt = requireText("updatedAt", input.updatedAt)
+  if (input.state !== "delivered" && input.state !== "indeterminate") {
+    throw new Error(`invalid comment delivery state: ${input.state}`)
+  }
+  await sql.run(
+    `UPDATE github_comment_delivery
+     SET state = ${placeholder(style, 1)}, updated_at = ${placeholder(style, 2)}
+     WHERE tenant_id = ${placeholder(style, 3)} AND repo_full_name = ${placeholder(style, 4)}
+       AND comment_id = ${placeholder(style, 5)} AND message_id = ${placeholder(style, 6)}`,
+    [input.state, updatedAt, tenantId, repoFullName, commentId, messageId]
+  )
+}
+
+async function releaseCommentDelivery(sql: Sql, style: SqlStyle, input: ReleaseCommentDeliveryInput): Promise<boolean> {
+  const tenantId = requireText("tenantId", input.tenantId)
+  const repoFullName = requireText("repoFullName", input.repoFullName).toLowerCase()
+  const commentId = requireText("commentId", input.commentId)
+  const messageId = requireText("messageId", input.messageId)
+  const changed = await sql.run(
+    `DELETE FROM github_comment_delivery
+     WHERE tenant_id = ${placeholder(style, 1)} AND repo_full_name = ${placeholder(style, 2)}
+       AND comment_id = ${placeholder(style, 3)} AND message_id = ${placeholder(style, 4)} AND state = 'sending'`,
+    [tenantId, repoFullName, commentId, messageId]
+  )
+  return changed > 0
+}
+
+async function readCommentDelivery(
+  sql: Sql,
+  style: SqlStyle,
+  tenantId: string,
+  repoFullName: string,
+  commentId: string
+): Promise<{ messageId: string; state: string } | null> {
+  const rows = await sql.all(
+    `SELECT message_id, state FROM github_comment_delivery
+     WHERE tenant_id = ${placeholder(style, 1)} AND repo_full_name = ${placeholder(style, 2)} AND comment_id = ${placeholder(style, 3)}`,
+    [tenantId, repoFullName, commentId]
+  )
+  if (rows.length === 0) return null
+  return { messageId: asString(rows[0].message_id), state: asString(rows[0].state) }
+}
+
+async function readSessionLink(sql: Sql, style: SqlStyle, tenantId: string, linkId: string): Promise<SessionLink | null> {
+  const rows = await sql.all(
+    `SELECT ${SESSION_LINK_COLUMNS} FROM session_link WHERE id = ${placeholder(style, 1)} AND tenant_id = ${placeholder(style, 2)}`,
+    [linkId, tenantId]
+  )
+  if (rows.length === 0) return null
+  return toSessionLink(rows[0])
 }
 
 function placeholder(style: SqlStyle, index: number): string {

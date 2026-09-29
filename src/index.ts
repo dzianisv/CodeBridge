@@ -71,6 +71,10 @@ const main = async () => {
       ingestToken: secrets.codexNotifyToken
     }))
 
+    // One shared context for GitHub webhooks and both pollers. Sharing is
+    // read per tenant at each createSession/appendTurn call. Do not put a
+    // global opencodeConfig here.
+    const harnessCtx = { store, config }
     const github = createGitHubApp(config, {
       githubAppId: secrets.githubAppId,
       githubPrivateKey: secrets.githubPrivateKey,
@@ -95,6 +99,9 @@ const main = async () => {
         branchPrefix: repo.branchPrefix,
         github: input.github
       })
+    }, {
+      store,
+      harness: harnessCtx
     })
     if (github) github.mount(app)
 
@@ -127,9 +134,6 @@ const main = async () => {
       })
     })
 
-    // One shared context for both pollers. Sharing is read per tenant at each
-    // createSession/appendTurn call. Do not put a global opencodeConfig here.
-    const harnessCtx = { store, config }
     startGitHubPolling({
       config,
       store,
@@ -143,9 +147,9 @@ const main = async () => {
       }
     })
 
-    // Issue assignment and mentions still go to run-service. PR assignment
-    // uses the HarnessCtx passed into startGitHubPolling. Linked Jira events
-    // go to harness.ts as well.
+    // Mentions still go to run-service. Issue assignment does too unless the
+    // repo is listed in harness.issueAssignmentRepos. PR assignment and linked
+    // Jira events use harnessCtx. Public sharing is not enabled here.
     startJiraPolling({
       config,
       store,
