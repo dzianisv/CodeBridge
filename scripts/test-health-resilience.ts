@@ -2,7 +2,7 @@ import http from "node:http"
 import type { AddressInfo } from "node:net"
 import express from "express"
 import { createHealthHandler } from "../src/health.js"
-import { getLoggerHealth, logger } from "../src/logger.js"
+import { getLogDestination, getLoggerHealth, logger } from "../src/logger.js"
 import { createSqliteStore, type RunStore } from "../src/storage.js"
 
 type JsonBody = { status?: string; database?: string; logging?: string }
@@ -121,12 +121,44 @@ async function main(): Promise<void> {
     }
     pass("database-unwritable-503")
 
+    const destination = getLogDestination()
+    if (destination === (process.stdout as unknown) || destination.fd !== 1) {
+      fail(
+        "logging-unwritable-503",
+        "production log destination must be Pino's fd 1 SonicBoom, not process.stdout"
+      )
+    }
+    const originalWrite = destination.write
+    let writes = 0
+    destination.write = function (): boolean {
+      writes += 1
+      return true
+    }
+    try {
+      logger.info("destination probe")
+    } finally {
+      destination.write = originalWrite
+    }
+    if (writes < 1) {
+      fail(
+        "logging-unwritable-503",
+        "logger did not write to getLogDestination(); refusing to inject ENOSPC on a non-production stream"
+      )
+    }
+
     const enospc = Object.assign(new Error("ENOSPC: no space left on device"), {
       code: "ENOSPC",
       errno: -28,
       syscall: "write"
     })
-    process.stdout.emit("error", enospc)
+    try {
+      destination.emit("error", enospc)
+    } catch (error) {
+      fail(
+        "logging-unwritable-503",
+        `destination ENOSPC was unhandled and would kill the process: ${error instanceof Error ? error.message : String(error)}`
+      )
+    }
     // Same shape as github-poll catch logging: logger.error(error, message).
     try {
       logger.error(new Error("probe"), "poll failure after ENOSPC")
@@ -137,7 +169,7 @@ async function main(): Promise<void> {
       )
     }
     if (!getLoggerHealth().degraded || getLoggerHealth().code !== "ENOSPC") {
-      fail("logging-unwritable-503", `stdout ENOSPC did not degrade logger: ${JSON.stringify(getLoggerHealth())}`)
+      fail("logging-unwritable-503", `destination ENOSPC did not degrade logger: ${JSON.stringify(getLoggerHealth())}`)
     }
 
     const logging = await getHealth(port, "/health-logging")
