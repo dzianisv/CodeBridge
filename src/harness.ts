@@ -21,6 +21,10 @@
 //   cover workspaces.
 // - ctx.sessions is a test seam so AC7 can fail one opencode call without
 //   depending on a nondeterministic server outage. Production omits it.
+// - Sharing is per tenant (tenant.opencode.sharingEnabled, default false), not
+//   a process-wide opencodeConfig.shareBaseUrl. The adapter still decides the
+//   POST /session/{id}/share call from a non-empty shareBaseUrl gate and returns
+//   the server's share.url. We set that gate only when this tenant opted in.
 
 import { logger } from "./logger.js"
 import {
@@ -131,11 +135,13 @@ export async function handleAssignmentEvent(ctx: HarnessCtx, ev: AssignmentEvent
 
   const initialKey = ev.keys[0] ?? attachKeys[0] ?? resolveKeys[0]
   const outsideWindow = existing?.status === "completed"
+  const sessionConfig = opencodeSessionConfigFor(ctx, ev.tenantId)
+  const sharingEnabled = tenantSharingEnabled(tenant)
   let created: OpencodeSession | null = null
   const link = await claimAndCreateLink(ctx.store, ev.tenantId, initialKey, async () => {
     created = await sessionsOf(ctx).createSession(
       { repoPath: ev.repoPath, title: ev.title },
-      ctx.opencodeConfig
+      sessionConfig
     )
     return { sessionId: created.sessionId }
   })
@@ -152,7 +158,7 @@ export async function handleAssignmentEvent(ctx: HarnessCtx, ev: AssignmentEvent
   }
   return {
     sessionId: link.opencodeSessionId,
-    reply: created ? shareReply(created) : unsharedSessionReply(link.opencodeSessionId),
+    reply: created ? shareReply(created, sharingEnabled) : unsharedSessionReply(link.opencodeSessionId),
     mirror
   }
 }
@@ -163,6 +169,7 @@ export async function handleCommentEvent(ctx: HarnessCtx, ev: CommentEvent): Pro
 
   const tenant = tenantOf(ctx, ev.tenantId)
   const mirror = mirrorFor(tenant)
+  const sessionConfig = opencodeSessionConfigFor(ctx, ev.tenantId)
   const { resolveKeys, attachKeys } = candidateKeys(ev)
   if (resolveKeys.length === 0) return null
 
@@ -207,7 +214,7 @@ export async function handleCommentEvent(ctx: HarnessCtx, ev: CommentEvent): Pro
   const sessionId = linked.opencodeSessionId
   const reply = await withSessionLock(sessionId, async () => {
     try {
-      const turn = await sessionsOf(ctx).appendTurn(sessionId, ev.commentBody, ctx.opencodeConfig)
+      const turn = await sessionsOf(ctx).appendTurn(sessionId, ev.commentBody, sessionConfig)
       await ctx.store.updateSessionLinkStatus({
         tenantId: ev.tenantId,
         linkId: linked.id,
@@ -240,9 +247,27 @@ export function unsharedSessionReply(sessionId: string): string {
   return `not sharing: run \`opencode --resume ${sessionId}\``
 }
 
-function shareReply(session: OpencodeSession): string {
-  if (session.shareUrl) return session.shareUrl
+function shareReply(session: OpencodeSession, sharingEnabled: boolean): string {
+  if (sharingEnabled && session.shareUrl) return session.shareUrl
   return unsharedSessionReply(session.sessionId)
+}
+
+// Adapter gate only. Not a tenant setting and not used to build the public URL.
+// POST /session/{id}/share still runs only when this string is non-empty.
+const OPENCODE_SHARE_GATE = "enabled"
+
+export function opencodeSessionConfigFor(ctx: HarnessCtx, tenantId: string): OpencodeSessionConfig {
+  const tenant = tenantOf(ctx, tenantId)
+  const baseUrl = tenant?.opencode?.baseUrl ?? ctx.opencodeConfig?.baseUrl
+  const config: OpencodeSessionConfig = {}
+  if (baseUrl) config.baseUrl = baseUrl
+  if (ctx.opencodeConfig?.timeoutMs != null) config.timeoutMs = ctx.opencodeConfig.timeoutMs
+  if (tenantSharingEnabled(tenant)) config.shareBaseUrl = OPENCODE_SHARE_GATE
+  return config
+}
+
+function tenantSharingEnabled(tenant: TenantConfig | undefined): boolean {
+  return tenant?.opencode?.sharingEnabled === true
 }
 
 function sessionsOf(ctx: HarnessCtx): HarnessSessionFns {
