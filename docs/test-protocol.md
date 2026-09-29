@@ -157,3 +157,40 @@ Result matrix:
   - the later Jira comment landed in `ses_f234055e5ffe3dsP4IZca6ro11`
 
 This run does not prove the PRD. See `OBJECTION.md`.
+
+## Live KPI3 session identity (opt-in)
+
+Supported runner: `npm run test:kpi3-live` via `tsx` on Node >= 18, with `gh` resolved from `PATH`. This is not a CI default and it is not the fake-Jira harness E2E. No live run is recorded in this section.
+
+The issue, PR, and repo are pinned and checked before credentials or network:
+
+- `--issue-key KAN-5`
+- `--pr 729`
+- `--repo dzianisv/codebridge-test`
+
+```bash
+npm run test:kpi3-live -- \
+  --confirm-live-write \
+  --issue-key KAN-5 \
+  --pr 729 \
+  --repo dzianisv/codebridge-test
+```
+
+Required at runtime, and never written by the script: `JIRA_EMAIL`, `JIRA_API_TOKEN`. Optional: `CONFIG_PATH`, `OPENCODE_BIN`, `CODEBRIDGE_SCRATCH_DIR`.
+
+What a passing run would show, and what it does not show:
+
+- Sharing stays omitted or false. The run must not call `/share`, `/message`, or `/prompt`.
+- GitHub is a GET of the pinned PR. The script does not modify the PR.
+- The `github_pr` step is a direct `handleAssignmentEvent` call. It is not GitHub poll pickup and it is not bot issue pickup.
+- The temp SQLite JOIN must show one session linked to both `KAN-5` and PR `729`.
+- A disposable Jira trigger comment, if this run created one, is deleted only after a read-back of that comment id. Other comments are left alone.
+- A failed temp database is kept and its path is printed. A successful one is deleted unless `--keep-db`.
+
+Scratch directory, in order: `CODEBRIDGE_SCRATCH_DIR`, then `$HERMES_HOME/cache/scratch`, then `os.tmpdir()`. The resolved path is refused when it is the repo, the configured database parent, or a symlink that escapes that root.
+
+Local negative coverage, with no live API calls:
+
+```bash
+npm run test:kpi3-guards
+```

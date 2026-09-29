@@ -20,6 +20,7 @@
     "test:opencode-session": "tsx scripts/test-opencode-session.ts",
     "test:sharing": "tsx scripts/test-kpi4-sharing.ts",
     "test:kpi3-live": "tsx scripts/test-kpi3-live.ts",
+    "test:kpi3-guards": "tsx scripts/test-kpi3-guards.ts",
     "eval": "env -u GITHUB_TOKEN -u AZURE_OPENAI_BASE_URL promptfoo eval",
     "eval:serial": "env -u GITHUB_TOKEN -u AZURE_OPENAI_BASE_URL promptfoo eval -j 1",
     "eval:view": "promptfoo view"

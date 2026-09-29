@@ -1,13 +1,12 @@
-import { spawn, type ChildProcess } from "node:child_process"
 import { execFile } from "node:child_process"
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import { once } from "node:events"
 import { mkdtempSync, rmSync } from "node:fs"
 import { mkdtemp, rm } from "node:fs/promises"
-import { createServer as createNetServer } from "node:net"
 import os from "node:os"
 import path from "node:path"
 import { promisify } from "node:util"
+import { startOpencodeServe, type OpencodeServeHandle } from "./lib/opencode-serve.js"
 import Database from "better-sqlite3"
 import { execa } from "execa"
 import { createSqliteStore, type RunStore } from "../src/storage.js"
@@ -76,7 +75,7 @@ const jiraServer = createServer((req, res) => {
 })
 
 let failed = 0
-let opencode: ChildProcess | null = null
+let opencode: OpencodeServeHandle | null = null
 let stopGitHub: (() => void) | undefined
 let repoPath = ""
 let dbDir = ""
@@ -117,14 +116,9 @@ try {
   if (!address || typeof address === "string") throw new Error("fake Jira did not bind")
   const jiraBaseUrl = `http://127.0.0.1:${address.port}`
 
-  const port = await freePort()
-  const baseUrl = `http://127.0.0.1:${port}`
   repoPath = await mkdtemp(path.join(os.tmpdir(), "codebridge-harness-e2e-"))
-  opencode = spawn(OPENCODE_BIN, ["serve", "--port", String(port), "--hostname", "127.0.0.1", "--print-logs"], {
-    detached: true,
-    stdio: ["ignore", "pipe", "pipe"]
-  })
-  await waitForServer(baseUrl, opencode)
+  opencode = await startOpencodeServe({ bin: OPENCODE_BIN })
+  const baseUrl = opencode.baseUrl
 
   dbDir = mkdtempSync(path.join(os.tmpdir(), "codebridge-harness-e2e-db-"))
   dbPath = path.join(dbDir, "store.db")
@@ -314,10 +308,13 @@ try {
   if (message !== "blocked" && results.every(item => item.status !== "fail")) {
     results.push({ name: "runner", status: "fail", details: message })
   }
-  if (message !== "blocked") console.error(message)
+  if (message !== "blocked") {
+    console.error(message)
+    if (opencode) console.error(opencode.recentLogs())
+  }
 } finally {
   stopGitHub?.()
-  if (opencode) await stopChild(opencode)
+  if (opencode) await opencode.stop()
   jiraServer.close()
   if (!args.keep && pr.number && resolvedRepo) {
     await gh(["pr", "close", String(pr.number), "--repo", resolvedRepo, "--delete-branch"]).catch(() => undefined)
@@ -506,52 +503,6 @@ function sendJson(res: ServerResponse, status: number, json: unknown) {
   res.statusCode = status
   res.setHeader("content-type", "application/json")
   res.end(JSON.stringify(json))
-}
-
-function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const server = createNetServer()
-    server.listen(0, "127.0.0.1", () => {
-      const bound = server.address()
-      if (!bound || typeof bound === "string") {
-        reject(new Error("failed to allocate a port"))
-        return
-      }
-      const chosen = bound.port
-      server.close(() => resolve(chosen))
-    })
-    server.on("error", reject)
-  })
-}
-
-async function waitForServer(url: string, proc: ChildProcess) {
-  const deadline = Date.now() + 40_000
-  let last = "not started"
-  while (Date.now() < deadline) {
-    if (proc.exitCode !== null) throw new Error(`opencode serve exited ${proc.exitCode}: ${last}`)
-    try {
-      const response = await fetch(`${url}/session/status`, { signal: AbortSignal.timeout(20_000) })
-      if (response.ok) return
-      last = `HTTP ${response.status}`
-    } catch (error) {
-      last = error instanceof Error ? error.message : String(error)
-    }
-    await delay(200)
-  }
-  throw new Error(`opencode serve did not become ready: ${last}`)
-}
-
-async function stopChild(proc: ChildProcess) {
-  if (!proc.pid || proc.exitCode !== null) return
-  try {
-    process.kill(-proc.pid, "SIGTERM")
-  } catch {
-    proc.kill("SIGTERM")
-  }
-  await Promise.race([
-    new Promise<void>(resolve => proc.once("exit", () => resolve())),
-    delay(2000)
-  ])
 }
 
 function delay(ms: number): Promise<void> {

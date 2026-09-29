@@ -203,6 +203,8 @@ Then in Jira: create an issue in the configured project and **assign it to the `
 
 There is no Jira-side success log line by design (only a warn on misconfiguration) — confirm pickup via the ticket comment, the local run record, or `data/codex-bridge.db`.
 
+The opt-in live KPI3 runner is `npm run test:kpi3-live`. It is pinned to Jira `KAN-5`, PR `#729`, and `dzianisv/codebridge-test`, and it refuses other targets before credentials or network. `gh` must be on `PATH`. It does not poll GitHub and it does not turn sharing on. Details are in [GitHub Surface Test Protocol](docs/test-protocol.md).
+
 ## Promptfoo Evaluation (Live Bot Quality)
 
 CodeBridge includes a custom promptfoo provider (`eval/provider.ts`) that:
@@ -243,6 +245,7 @@ pnpm lint
 pnpm test:github-polling
 pnpm test:github-protocol
 pnpm test:vibe-agents
+pnpm test:kpi3-guards
 ```
 
 ## Troubleshooting
