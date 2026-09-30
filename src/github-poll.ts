@@ -332,8 +332,7 @@ async function pollAssignedIssues(input: {
   runService: RunService
   appIdentityPromise: Promise<{ slug?: string; botLogin?: string } | null>
 }): Promise<void> {
-  const appIdentity = await resolveAppIdentityWithTimeout(input.appIdentityPromise)
-  const assignees = resolveAssignmentAssignees(input.tenant.github?.assignmentAssignees, appIdentity?.botLogin)
+  const assignees = await resolveValidatedAssignmentAssignees(input)
   if (assignees.length === 0) return
 
   const issuesByNumber = new Map<number, {
@@ -357,6 +356,14 @@ async function pollAssignedIssues(input: {
         direction: "desc"
       })
     } catch (error) {
+      if (markAssigneeUnknownOnList422(error, {
+        tenantId: input.tenant.id,
+        installationId: input.tenant.github?.installationId,
+        repoFullName: input.repo.fullName,
+        login: assignee
+      })) {
+        continue
+      }
       logger.warn({
         err: error,
         tenantId: input.tenant.id,
@@ -426,8 +433,7 @@ async function pollAssignedPullRequests(input: {
   harness: HarnessCtx
   appIdentityPromise: Promise<{ slug?: string; botLogin?: string } | null>
 }): Promise<void> {
-  const appIdentity = await resolveAppIdentityWithTimeout(input.appIdentityPromise)
-  const assignees = resolveAssignmentAssignees(input.tenant.github?.assignmentAssignees, appIdentity?.botLogin)
+  const assignees = await resolveValidatedAssignmentAssignees(input)
   if (assignees.length === 0) return
 
   const numbers = new Set<number>()
@@ -444,6 +450,14 @@ async function pollAssignedPullRequests(input: {
         direction: "desc"
       })
     } catch (error) {
+      if (markAssigneeUnknownOnList422(error, {
+        tenantId: input.tenant.id,
+        installationId: input.tenant.github?.installationId,
+        repoFullName: input.repo.fullName,
+        login: assignee
+      })) {
+        continue
+      }
       logger.warn({
         err: error,
         tenantId: input.tenant.id,
@@ -708,6 +722,295 @@ function resolveAssignmentAssignees(configured: string[] | undefined, botLogin?:
     values.add(normalized)
   }
   return [...values]
+}
+
+const ASSIGNEE_VALIDATION_TTL_MS = 5 * 60 * 1000
+const ASSIGNEE_UNKNOWN_RETRY_MS = ASSIGNEE_VALIDATION_TTL_MS
+
+type AssigneeValidityStatus = "valid" | "invalid" | "unknown"
+type AssigneeInstallationId = number | "none"
+
+type AssigneeValidityEntry = {
+  installationId: AssigneeInstallationId
+  repo: string
+  login: string
+  status: AssigneeValidityStatus
+  httpStatus: number | null
+  checkedAt: number
+}
+
+const assigneeValidityCache = new Map<string, AssigneeValidityEntry>()
+let assigneeValidationNow = (): number => Date.now()
+
+export type AssigneeValidationHealth = {
+  ttlMs: number
+  unknownRetryMs: number
+  counts: { valid: number; invalid: number; unknown: number }
+  entries: Array<{
+    installationId: AssigneeInstallationId
+    repo: string
+    login: string
+    status: AssigneeValidityStatus
+    httpStatus: number | null
+    checkedAt: string
+    ageMs: number
+  }>
+}
+
+export function resetAssigneeValidityCacheForTests(): void {
+  assigneeValidityCache.clear()
+}
+
+export function setAssigneeValidationNowForTests(now: (() => number) | null): void {
+  assigneeValidationNow = now ?? (() => Date.now())
+}
+
+export function getAssigneeValidationHealth(): AssigneeValidationHealth {
+  const now = assigneeValidationNow()
+  const entries = [...assigneeValidityCache.values()]
+    .sort((a, b) => {
+      const installation = compareInstallationId(a.installationId, b.installationId)
+      if (installation !== 0) return installation
+      return a.repo.localeCompare(b.repo) || a.login.localeCompare(b.login)
+    })
+    .map(entry => ({
+      installationId: entry.installationId,
+      repo: entry.repo,
+      login: entry.login,
+      status: entry.status,
+      httpStatus: entry.httpStatus,
+      checkedAt: new Date(entry.checkedAt).toISOString(),
+      ageMs: Math.max(0, now - entry.checkedAt)
+    }))
+  return {
+    ttlMs: ASSIGNEE_VALIDATION_TTL_MS,
+    unknownRetryMs: ASSIGNEE_UNKNOWN_RETRY_MS,
+    counts: {
+      valid: entries.filter(entry => entry.status === "valid").length,
+      invalid: entries.filter(entry => entry.status === "invalid").length,
+      unknown: entries.filter(entry => entry.status === "unknown").length
+    },
+    entries
+  }
+}
+
+function compareInstallationId(a: AssigneeInstallationId, b: AssigneeInstallationId): number {
+  if (a === b) return 0
+  if (a === "none") return 1
+  if (b === "none") return -1
+  return a - b
+}
+
+function installationCacheId(installationId: number | undefined): AssigneeInstallationId {
+  return installationId ?? "none"
+}
+
+function assigneeCacheKey(installationId: AssigneeInstallationId, repoFullName: string, login: string): string {
+  return `${installationId}::${repoFullName.toLowerCase()}::${login.toLowerCase()}`
+}
+
+function readHttpStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== "object" || !("status" in error)) return undefined
+  const status = (error as { status?: unknown }).status
+  return typeof status === "number" ? status : undefined
+}
+
+type AssigneeQuery = {
+  status: AssigneeValidityStatus
+  httpStatus: number | null
+}
+
+async function queryAssigneeValidity(
+  client: GitHubClient,
+  owner: string,
+  repo: string,
+  login: string
+): Promise<AssigneeQuery> {
+  try {
+    const response = await client.octokit.issues.checkUserCanBeAssigned({
+      owner,
+      repo,
+      assignee: login
+    })
+    const httpStatus = typeof response.status === "number" ? response.status : null
+    if (httpStatus === 204) return { status: "valid", httpStatus }
+    if (httpStatus === 404) return { status: "invalid", httpStatus }
+    return { status: "unknown", httpStatus }
+  } catch (error) {
+    const httpStatus = readHttpStatus(error) ?? null
+    if (httpStatus === 404) return { status: "invalid", httpStatus }
+    return { status: "unknown", httpStatus }
+  }
+}
+
+function logAssigneeValidityTransition(input: {
+  status: "invalid" | "unknown"
+  tenantId: string
+  installationId: AssigneeInstallationId
+  repo: string
+  login: string
+  httpStatus: number | null
+}): void {
+  logger.warn({
+    tenantId: input.tenantId,
+    installationId: input.installationId,
+    repo: input.repo,
+    login: input.login,
+    httpStatus: input.httpStatus
+  }, input.status === "invalid"
+    ? "Assignment assignee is not assignable in this repo"
+    : "Assignment assignee validity is unknown")
+}
+
+function markAssigneeUnknownOnList422(
+  error: unknown,
+  input: {
+    tenantId: string
+    installationId: number | undefined
+    repoFullName: string
+    login: string
+  }
+): boolean {
+  if (readHttpStatus(error) !== 422) return false
+  const installationId = installationCacheId(input.installationId)
+  const key = assigneeCacheKey(installationId, input.repoFullName, input.login)
+  const previous = assigneeValidityCache.get(key)?.status
+  assigneeValidityCache.set(key, {
+    installationId,
+    repo: input.repoFullName,
+    login: input.login,
+    status: "unknown",
+    httpStatus: 422,
+    checkedAt: assigneeValidationNow()
+  })
+  if (previous !== "unknown") {
+    logAssigneeValidityTransition({
+      status: "unknown",
+      tenantId: input.tenantId,
+      installationId,
+      repo: input.repoFullName,
+      login: input.login,
+      httpStatus: 422
+    })
+  }
+  return true
+}
+
+async function cachedAssigneeValidity(input: {
+  client: GitHubClient
+  owner: string
+  repo: string
+  repoFullName: string
+  tenantId: string
+  installationId: number | undefined
+  login: string
+}): Promise<AssigneeValidityStatus> {
+  const installationId = installationCacheId(input.installationId)
+  const key = assigneeCacheKey(installationId, input.repoFullName, input.login)
+  const now = assigneeValidationNow()
+  const cached = assigneeValidityCache.get(key)
+  const retryMs = cached?.status === "unknown" ? ASSIGNEE_UNKNOWN_RETRY_MS : ASSIGNEE_VALIDATION_TTL_MS
+  if (cached && now - cached.checkedAt < retryMs) return cached.status
+
+  const result = await queryAssigneeValidity(input.client, input.owner, input.repo, input.login)
+  const previous = cached?.status
+  assigneeValidityCache.set(key, {
+    installationId,
+    repo: input.repoFullName,
+    login: input.login,
+    status: result.status,
+    httpStatus: result.httpStatus,
+    checkedAt: now
+  })
+  if (result.status === "invalid" && previous !== "invalid") {
+    logAssigneeValidityTransition({
+      status: "invalid",
+      tenantId: input.tenantId,
+      installationId,
+      repo: input.repoFullName,
+      login: input.login,
+      httpStatus: result.httpStatus
+    })
+  }
+  if (result.status === "unknown" && previous !== "unknown") {
+    logAssigneeValidityTransition({
+      status: "unknown",
+      tenantId: input.tenantId,
+      installationId,
+      repo: input.repoFullName,
+      login: input.login,
+      httpStatus: result.httpStatus
+    })
+  }
+  return result.status
+}
+
+async function resolveValidatedAssignmentAssignees(input: {
+  tenant: TenantConfig
+  repo: RepoConfig
+  owner: string
+  repoName: string
+  client: GitHubClient
+  appIdentityPromise: Promise<{ slug?: string; botLogin?: string } | null>
+}): Promise<string[]> {
+  const appIdentity = await resolveAppIdentityWithTimeout(input.appIdentityPromise)
+  const candidates = resolveAssignmentAssignees(input.tenant.github?.assignmentAssignees, appIdentity?.botLogin)
+  const valid: string[] = []
+  for (const login of candidates) {
+    const status = await cachedAssigneeValidity({
+      client: input.client,
+      owner: input.owner,
+      repo: input.repoName,
+      repoFullName: input.repo.fullName,
+      tenantId: input.tenant.id,
+      installationId: input.tenant.github?.installationId,
+      login
+    })
+    if (status === "valid") valid.push(login)
+  }
+  return valid
+}
+
+export async function pollValidatedAssignmentForTests(input: {
+  surface: "issues" | "pull_requests"
+  tenant: TenantConfig
+  repo: RepoConfig
+  client: GitHubClient
+  botLogin?: string
+}): Promise<void> {
+  const [owner, repoName] = input.repo.fullName.split("/")
+  if (!owner || !repoName) throw new Error(`invalid repo fullName: ${input.repo.fullName}`)
+  const appIdentityPromise = Promise.resolve(input.botLogin ? { botLogin: input.botLogin } : null)
+  if (input.surface === "issues") {
+    await pollAssignedIssues({
+      tenant: input.tenant,
+      repo: input.repo,
+      owner,
+      repoName,
+      client: input.client,
+      store: {
+        getRunBySourceKey: async () => {
+          throw new Error("issue assignment poll reached store")
+        }
+      } as unknown as RunStore,
+      runService: {
+        createRun: async () => {
+          throw new Error("issue assignment poll reached run service")
+        }
+      } as unknown as RunService,
+      appIdentityPromise
+    })
+    return
+  }
+  await pollAssignedPullRequests({
+    tenant: input.tenant,
+    repo: input.repo,
+    owner,
+    repoName,
+    client: input.client,
+    harness: {} as HarnessCtx,
+    appIdentityPromise
+  })
 }
 
 async function resolveDefaultPrefixesWithTimeout(

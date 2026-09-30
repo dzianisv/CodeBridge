@@ -9,7 +9,7 @@ import { startSlack } from "./slack.js"
 import { createGitHubApp } from "./github.js"
 import { resolveRepo, ensureRepoPath } from "./repo.js"
 import { logger } from "./logger.js"
-import { startGitHubPolling } from "./github-poll.js"
+import { getAssigneeValidationHealth, startGitHubPolling } from "./github-poll.js"
 import { createHarnessBackedJiraPoller, startJiraPolling } from "./jira-poll.js"
 import { createCodexNotifyHandler } from "./codex-notify.js"
 import type { AppConfig } from "./types.js"
@@ -59,7 +59,10 @@ const main = async () => {
     app.use(express.json({ limit: "1mb" }))
 
     app.get("/health", (_req, res) => {
-      res.json({ status: "ok" })
+      res.json({
+        status: "ok",
+        assigneeValidation: getAssigneeValidationHealth()
+      })
     })
     app.post("/codex/notify", createCodexNotifyHandler({
       config,
