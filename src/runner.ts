@@ -11,7 +11,7 @@ import { updateSlackStatus, postSlackStatus } from "./slack.js"
 import { createInstallationClient, formatPrivateKey } from "./github-auth.js"
 import { syncIssueLifecycleState } from "./github-issue-state.js"
 import { isDiscussionSourceKey, postDiscussionCommentFromContext } from "./github-discussions.js"
-import { isDirty, fetchOrigin, createBranch, commitAll, pushBranch, getDefaultBranchFromOrigin } from "./git.js"
+import { isDirty, fetchOrigin, commitAll, pushBranch, getDefaultBranchFromOrigin, addWorktree, removeWorktree, worktreePathForRun } from "./git.js"
 import { logger } from "./logger.js"
 import type { VibeAgentsSink } from "./vibe-agents.js"
 
@@ -99,12 +99,13 @@ export function createRunner(params: {
       }
     }
 
+    const worktreePath = worktreePathForRun(run.repoPath, run.id)
     try {
       const baseBranch = await resolveBaseBranch(run)
       const branchName = buildBranchName(run, baseBranch)
       await store.updateRunBranch(run.id, branchName)
 
-      await prepareRepo(run, baseBranch, branchName)
+      const workspace = await prepareRepo(run, baseBranch, branchName)
       await updateStatus("running")
 
       const prompt = buildPrompt(run)
@@ -124,7 +125,7 @@ export function createRunner(params: {
         }
       })
       const thread = codex.startThread({
-        workingDirectory: run.repoPath,
+        workingDirectory: workspace,
         model: run.model,
         // The bridge must be able to create/edit files and push branches.
         sandboxMode: "workspace-write",
@@ -155,7 +156,7 @@ export function createRunner(params: {
         clearTimeout(turnTimeout)
       }
 
-      const hasChanges = await isDirty(run.repoPath)
+      const hasChanges = await isDirty(workspace)
       if (!hasChanges) {
         await store.updateRunStatus(run.id, "no_changes")
         void vibeAgents?.sendRunStatus(run, "no_changes", {
@@ -171,7 +172,7 @@ export function createRunner(params: {
         return
       }
 
-      await commitAll(run.repoPath, buildCommitMessage(run))
+      await commitAll(workspace, buildCommitMessage(run))
 
       if (!run.github || !githubClient) {
         await store.updateRunStatus(run.id, "failed")
@@ -187,7 +188,7 @@ export function createRunner(params: {
       }
 
       const remoteUrl = buildRemoteUrl(run, githubClient.token)
-      await pushBranch(run.repoPath, remoteUrl, branchName)
+      await pushBranch(workspace, remoteUrl, branchName)
 
       const pr = await githubClient.octokit.pulls.create({
         owner: run.github.owner,
@@ -225,6 +226,12 @@ export function createRunner(params: {
       tracker.pushLine(runError.message)
       await updateStatus("failed")
       throw runError
+    } finally {
+      try {
+        await removeWorktree(run.repoPath, worktreePath)
+      } catch (error) {
+        logger.warn({ err: error, runId: run.id, worktreePath }, "Failed to remove run worktree")
+      }
     }
   }
 }
@@ -269,12 +276,11 @@ function buildBranchName(run: RunRecord, base: string): string {
   return `${prefix}-${suffix}`
 }
 
-async function prepareRepo(run: RunRecord, baseBranch: string, branchName: string): Promise<void> {
-  if (await isDirty(run.repoPath)) {
-    throw new Error("Repository has uncommitted changes")
-  }
+export async function prepareRepo(run: RunRecord, baseBranch: string, branchName: string): Promise<string> {
   await fetchOrigin(run.repoPath)
-  await createBranch(run.repoPath, branchName, `origin/${baseBranch}`)
+  const worktreePath = worktreePathForRun(run.repoPath, run.id)
+  await addWorktree(run.repoPath, worktreePath, branchName, `origin/${baseBranch}`)
+  return worktreePath
 }
 
 function buildPrompt(run: RunRecord): string {
