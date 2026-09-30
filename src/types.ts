@@ -19,6 +19,13 @@ export type JiraConfig = {
   pollIntervalSec: number
 }
 
+// LLD §4. `sharingEnabled` defaults to false when omitted. Do not add shareBaseUrl
+// here — that key is not an opencode concept and is not a tenant setting.
+export type OpencodeConfig = {
+  baseUrl?: string
+  sharingEnabled?: boolean
+}
+
 // LLD §7. Write-back (mirrorReplies) is decided here; harness.ts does not post it.
 export type HarnessConfig = {
   mirrorReplies?: "origin-only" | "all"
@@ -52,6 +59,7 @@ export type TenantConfig = {
   slack?: SlackConfig
   github?: GitHubConfig
   jira?: JiraConfig
+  opencode?: OpencodeConfig
   harness?: HarnessConfig
   repos: RepoConfig[]
   defaultRepo?: string

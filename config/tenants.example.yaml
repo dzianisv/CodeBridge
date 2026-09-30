@@ -33,6 +33,12 @@ tenants:
     # harness:
     #   mirrorReplies: "origin-only"
     #   reactivationWindowMinutes: 60
+    # Optional. Default sharingEnabled is false (omit the block for the same
+    # result). Do not set shareBaseUrl — it is not a tenant setting. Turn sharing
+    # on only if public opencode share links are acceptable for this tenant.
+    # opencode:
+    #   baseUrl: "http://127.0.0.1:4096"
+    #   sharingEnabled: false
     # Optional. Omit to leave Jira polling off. Email/token stay in secrets or env, not here.
     # jira:
     #   baseUrl: "https://yourorg.atlassian.net"

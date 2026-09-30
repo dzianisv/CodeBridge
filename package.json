@@ -18,6 +18,7 @@
     "test:github-protocol": "tsx scripts/test-github-protocol.ts",
     "test:vibe-agents": "tsx scripts/test-vibe-agents.ts",
     "test:opencode-session": "tsx scripts/test-opencode-session.ts",
+    "test:sharing": "tsx scripts/test-kpi4-sharing.ts",
     "eval": "env -u GITHUB_TOKEN -u AZURE_OPENAI_BASE_URL promptfoo eval",
     "eval:serial": "env -u GITHUB_TOKEN -u AZURE_OPENAI_BASE_URL promptfoo eval -j 1",
     "eval:view": "promptfoo view"

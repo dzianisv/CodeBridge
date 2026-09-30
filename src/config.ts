@@ -37,6 +37,13 @@ const jiraSchema = z.object({
   pollIntervalSec: z.number().int().positive()
 })
 
+// LLD §4 / §7. Omit the block and sharing stays off. `shareBaseUrl` is rejected
+// so a tenant file cannot turn the public share call on through the old gate.
+const opencodeSchema = z.object({
+  baseUrl: z.string().url().optional(),
+  sharingEnabled: z.boolean().optional()
+}).strict()
+
 // Same optional-block pattern as `jira`: omit the block and polling/routing
 // keeps the LLD §7 defaults (origin-only, 60 minutes).
 const harnessSchema = z.object({
@@ -50,6 +57,7 @@ const tenantSchema = z.object({
   slack: slackSchema.optional(),
   github: githubSchema.optional(),
   jira: jiraSchema.optional(),
+  opencode: opencodeSchema.optional(),
   harness: harnessSchema.optional(),
   repos: z.array(repoSchema),
   defaultRepo: z.string().optional()

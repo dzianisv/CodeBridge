@@ -124,11 +124,14 @@ const main = async () => {
       })
     })
 
+    // One shared context for both pollers. Sharing is read per tenant at each
+    // createSession/appendTurn call. Do not put a global opencodeConfig here.
+    const harnessCtx = { store, config }
     startGitHubPolling({
       config,
       store,
       runService,
-      harness: { store, config },
+      harness: harnessCtx,
       env: {
         githubAppId: secrets.githubAppId,
         githubPrivateKey: secrets.githubPrivateKey,
@@ -143,7 +146,7 @@ const main = async () => {
     startJiraPolling({
       config,
       store,
-      harness: createHarnessBackedJiraPoller({ store, config }),
+      harness: createHarnessBackedJiraPoller(harnessCtx),
       env: {
         jiraEmail: secrets.jiraEmail,
         jiraApiToken: secrets.jiraApiToken
