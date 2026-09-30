@@ -1,8 +1,9 @@
 import type { AppConfig, RepoConfig, TenantConfig } from "./types.js"
 import { SessionLinkResolveConflictError, type RunStore } from "./storage.js"
 import type { RunService } from "./run-service.js"
-import { handleAssignmentEvent, handleCommentEvent, type HarnessCtx } from "./harness.js"
-import { resolveLink, SessionLinkPendingError } from "./session-links.js"
+import { handleAssignmentEvent, type HarnessCtx } from "./harness.js"
+import { handleOptInIssueAssignment, issueAssignmentEnabled, routeLinkedGitHubComment } from "./issue-assignment.js"
+import { nanoid } from "nanoid"
 import { createInstallationClient, formatPrivateKey } from "./github-auth.js"
 import { extractCommand, extractCommandFromManagedIssue, type CommandType } from "./commands.js"
 import {
@@ -97,6 +98,7 @@ export function startGitHubPolling(params: {
       client,
       store,
       runService,
+      harness,
       appIdentityPromise
     })
 
@@ -188,36 +190,20 @@ export function startGitHubPolling(params: {
         // resolveLink is checked before the legacy command-prefix gate; a
         // miss (or an ambiguous/pending link) falls through unchanged.
         const issueMetaForLink = await getIssueMeta(issueNumber)
-        const linkKey = issueMetaForLink.isPullRequest
-          ? { kind: "gh_pr" as const, repo: repoFullName, number: issueNumber }
-          : { kind: "gh_issue" as const, repo: repoFullName, number: issueNumber }
-        try {
-          const existingLink = await resolveLink(store, tenant.id, [linkKey])
-          if (existingLink) {
-            await handleCommentEvent(harness, {
-              source: issueMetaForLink.isPullRequest ? "github_pr" : "github_issue",
-              tenantId: tenant.id,
-              keys: [linkKey],
-              commentBody: comment.body,
-              authorIsBot: false,
-              repoPath: await ensureRepoPath(repo),
-              title: issueMetaForLink.title
-            })
-            continue
-          }
-        } catch (error) {
-          if (error instanceof SessionLinkPendingError) throw error
-          if (error instanceof SessionLinkResolveConflictError) {
-            logger.warn({
-              err: error,
-              tenantId: tenant.id,
-              repo: repoFullName,
-              issueNumber
-            }, "github comment keys resolve to more than one session link; not routing")
-            continue
-          }
-          throw error
-        }
+        const linked = await deliverPolledIssueComment({
+          store,
+          harness,
+          tenantId: tenant.id,
+          repoFullName,
+          issueNumber,
+          isPullRequest: issueMetaForLink.isPullRequest,
+          title: issueMetaForLink.title,
+          commentBody: comment.body,
+          authorIsBot: false,
+          repoPath: await ensureRepoPath(repo),
+          commentId: comment.id
+        })
+        if (linked === "routed" || linked === "conflict" || linked === "indeterminate") continue
 
         const assigneePrefixes = buildAssigneeMentionPrefixes(tenant.github?.assignmentAssignees)
         const prefixes = mergeGithubCommandPrefixes(
@@ -322,7 +308,23 @@ export function startGitHubPolling(params: {
   return () => clearInterval(timer)
 }
 
-async function pollAssignedIssues(input: {
+export async function deliverPolledIssueComment(input: {
+  store: RunStore
+  harness: HarnessCtx
+  tenantId: string
+  repoFullName: string
+  issueNumber: number
+  isPullRequest: boolean
+  title?: string
+  commentBody: string
+  authorIsBot: boolean
+  repoPath?: string
+  commentId?: number | string
+}): Promise<"routed" | "unlinked" | "conflict" | "indeterminate"> {
+  return routeLinkedGitHubComment(input)
+}
+
+export async function pollAssignedIssues(input: {
   tenant: TenantConfig
   repo: RepoConfig
   owner: string
@@ -330,6 +332,7 @@ async function pollAssignedIssues(input: {
   client: GitHubClient
   store: RunStore
   runService: RunService
+  harness: HarnessCtx
   appIdentityPromise: Promise<{ slug?: string; botLogin?: string } | null>
 }): Promise<void> {
   const assignees = await resolveValidatedAssignmentAssignees(input)
@@ -386,8 +389,39 @@ async function pollAssignedIssues(input: {
 
   for (const issue of issuesByNumber.values()) {
     if (issue.pull_request) continue
-    if (hasManagedLabel(issue.labels)) continue
     if (!issue.number) continue
+
+    // Opt-in is checked before the managed-label skip. The label is the Codex
+    // dedupe, not the harness one; skipping here would drop a pending turn
+    // after restart. Legacy issues still hit that skip below, unchanged.
+    if (issueAssignmentEnabled(input.tenant, input.repo.fullName)) {
+      const repoPath = await ensureRepoPath(input.repo)
+      const routed = await handleOptInIssueAssignment({
+        store: input.store,
+        harness: input.harness,
+        tenant: input.tenant,
+        repo: input.repo,
+        owner: input.owner,
+        repoName: input.repoName,
+        installationId: input.tenant.github?.installationId,
+        issueNumber: issue.number,
+        title: issue.title,
+        body: issue.body ?? undefined,
+        repoPath,
+        runId: nanoid(8)
+      })
+      if (routed.path === "conflict" || routed.path === "failed" || routed.path === "pending" || routed.path === "indeterminate") {
+        logger.warn({
+          tenantId: input.tenant.id,
+          repo: input.repo.fullName,
+          issueNumber: issue.number,
+          result: routed
+        }, "opt-in issue assignment did not complete")
+      }
+      continue
+    }
+
+    if (hasManagedLabel(issue.labels)) continue
 
     const sourceKey = [
       "github-assigned",
@@ -424,7 +458,7 @@ async function pollAssignedIssues(input: {
 // still skips pull_request items so this does not double-bootstrap run-service.
 // Do not resolve Closes/branch/hints here: candidateKeys() in harness.ts is
 // the only precedence. This only fills AssignmentEvent and hands it off.
-async function pollAssignedPullRequests(input: {
+export async function pollAssignedPullRequests(input: {
   tenant: TenantConfig
   repo: RepoConfig
   owner: string
@@ -998,6 +1032,22 @@ export async function pollValidatedAssignmentForTests(input: {
           throw new Error("issue assignment poll reached run service")
         }
       } as unknown as RunService,
+      harness: {
+        store: {
+          getRunBySourceKey: async () => {
+            throw new Error("issue assignment poll reached harness")
+          }
+        } as unknown as RunStore,
+        config: { tenants: [input.tenant] },
+        sessions: {
+          createSession: async () => {
+            throw new Error("issue assignment poll reached harness")
+          },
+          appendTurn: async () => {
+            throw new Error("issue assignment poll reached harness")
+          }
+        }
+      },
       appIdentityPromise
     })
     return

@@ -27,9 +27,12 @@ export type OpencodeConfig = {
 }
 
 // LLD §7. Write-back (mirrorReplies) is decided here; harness.ts does not post it.
+// issueAssignmentRepos is the opt-in for GitHub issue assignment -> OpenCode.
+// Absent or empty keeps the existing Codex assignment path.
 export type HarnessConfig = {
   mirrorReplies?: "origin-only" | "all"
   reactivationWindowMinutes?: number
+  issueAssignmentRepos?: string[]
 }
 
 export type VibeAgentsIntegrationConfig = {

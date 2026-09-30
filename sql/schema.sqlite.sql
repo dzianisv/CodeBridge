@@ -56,8 +56,27 @@ CREATE TABLE IF NOT EXISTS session_link (
   status TEXT NOT NULL DEFAULT 'active',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
+  source_key TEXT,
+  run_id TEXT,
+  turn_state TEXT,
+  turn_error TEXT,
+  turn_message_id TEXT,
+  turn_prompt TEXT,
   UNIQUE (tenant_id, opencode_session_id),
   UNIQUE (id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS session_link_source_key_idx ON session_link (source_key);
+CREATE UNIQUE INDEX IF NOT EXISTS session_link_run_id_idx ON session_link (run_id);
+
+CREATE TABLE IF NOT EXISTS github_comment_delivery (
+  tenant_id TEXT NOT NULL,
+  repo_full_name TEXT NOT NULL,
+  comment_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (tenant_id, repo_full_name, comment_id)
 );
 
 -- repo_key is derived from repo ('' when repo is NULL) so a Jira NULL repo

@@ -79,6 +79,31 @@ Result matrix:
 - `discussion-mention`: `blocked`
   - reason: app installation lacks Discussions permission on `VibeTechnologies/vibeteam-eval-hello-world`
 
+## Opt-in issue assignment (KPI2 harness path)
+
+Default remains the Codex issue-assignment path. A repo listed in
+`tenant.harness.issueAssignmentRepos` routes poll and webhook issue assignment
+through one handler. That handler claims the `gh_issue` key, reuses an existing
+Jira or issue link, records exactly one `runs` row with status `harness` (not
+queued, not a Codex success), and sends one initial work turn. It does not
+queue a Codex worker. Public sharing stays off.
+
+The initial turn is not replayed from a stale `in_progress` lease. OpenCode
+v1.18.32 stores a client `messageID`, but posting that id again appends another
+part, so it is not an idempotency token. Recovery GETs the recorded message.
+One exact prompt part is completed with no second POST. A 404, lookup failure,
+or content mismatch is `indeterminate` and needs operator recovery. Poll and
+webhook comments on a linked issue/PR claim `github_comment_delivery` by
+comment id before append, so the same comment is not sent twice.
+
+```bash
+PATH="$HOME/.nvm/versions/node/v22.23.1/bin:$PATH" pnpm test:issue-assignment
+```
+
+Pass marker: `test:issue-assignment passed`. The script exits non-zero on any
+failed case. It starts a local `opencode serve` and uses fake GitHub/Jira HTTP.
+It does not create live issues or enable sharing.
+
 ## Agent Harness E2E (Jira + linked PR + Jira comment)
 
 LLD section 8 item 7. This is not `scripts/test-harness.ts`. That script calls
