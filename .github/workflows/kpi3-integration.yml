@@ -1,0 +1,148 @@
+name: kpi3-integration
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 08:00 UTC daily. Scheduled runs use the default-branch workflow file.
+    # The Trusted main branch step below refuses any non-main GITHUB_REF,
+    # so both schedule and workflow_dispatch execute only main code.
+    - cron: "0 8 * * *"
+
+concurrency:
+  group: kpi3-sandbox
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  kpi3-live:
+    name: kpi3-live
+    runs-on: ubuntu-latest
+    environment: integration
+    steps:
+      - name: Trusted main branch only
+        run: |
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "Refusing to run: trusted main branch required (got ${GITHUB_REF})"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm 10
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install opencode-ai
+        id: opencode
+        run: |
+          npm install -g opencode-ai@1.18.33
+          bin="$(command -v opencode)"
+          if [ -z "${bin}" ]; then
+            echo "opencode not found after npm install -g opencode-ai@1.18.33"
+            exit 1
+          fi
+          echo "bin=${bin}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Require integration Environment secrets and write live config
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_AGENT_ACCOUNT_ID: ${{ secrets.JIRA_AGENT_ACCOUNT_ID }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          node --input-type=module <<'EOF'
+          import { chmodSync, unlinkSync, writeFileSync } from "node:fs";
+          import yaml from "js-yaml";
+
+          const keys = [
+            "JIRA_BASE_URL",
+            "JIRA_AGENT_ACCOUNT_ID",
+            "JIRA_EMAIL",
+            "JIRA_API_TOKEN",
+          ];
+          const missing = keys.filter((key) => !process.env[key]);
+          if (missing.length > 0) {
+            console.error(
+              "Missing integration Environment secrets: " + missing.join(",")
+            );
+            process.exit(1);
+          }
+
+          const config = {
+            tenants: [
+              {
+                id: "ci-kpi3",
+                name: "CI KPI3",
+                github: {
+                  repoAllowlist: ["dzianisv/codebridge-test"],
+                },
+                jira: {
+                  baseUrl: process.env.JIRA_BASE_URL,
+                  projectKey: "KAN",
+                  repo: "dzianisv/codebridge-test",
+                  agentAccountId: process.env.JIRA_AGENT_ACCOUNT_ID,
+                  pollIntervalSec: 30,
+                },
+                repos: [
+                  {
+                    fullName: "dzianisv/codebridge-test",
+                    path: "/home/runner/work/codebridge-kpi3-fixture",
+                  },
+                ],
+                defaultRepo: "dzianisv/codebridge-test",
+              },
+            ],
+          };
+
+          const dest = `${process.env.RUNNER_TEMP}/kpi3-live.config.yaml`;
+          try {
+            unlinkSync(dest);
+          } catch {
+            // absent
+          }
+          writeFileSync(dest, yaml.dump(config), { mode: 0o600 });
+          chmodSync(dest, 0o600);
+          console.log("Wrote live YAML config (no credential values)");
+          EOF
+
+      - name: Run kpi3 live test
+        env:
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          CONFIG_PATH: ${{ runner.temp }}/kpi3-live.config.yaml
+          OPENCODE_BIN: ${{ steps.opencode.outputs.bin }}
+          CODEBRIDGE_SCRATCH_DIR: ${{ runner.temp }}/kpi3-scratch
+        run: |
+          set -o pipefail
+          mkdir -p "${CODEBRIDGE_SCRATCH_DIR}"
+          log="${RUNNER_TEMP}/kpi3-live.log"
+          set +e
+          npm run test:kpi3-live -- --confirm-live-write --issue-key KAN-5 --pr 729 --repo dzianisv/codebridge-test 2>&1 | tee "${log}"
+          status=$?
+          set -e
+          rejected=0
+          if grep -Fq -e 'MARKER: fail' -e 'MARKER: refused' "${log}"; then
+            echo "Rejected MARKER: fail or MARKER: refused"
+            rejected=1
+          fi
+          if ! grep -Fxq 'RESULT: PASS for live Jira poll + write-back read-back + GitHub GET read-back + direct PR handler. GitHub poll pickup was NOT exercised.' "${log}"; then
+            echo "Missing exact result marker"
+            rejected=1
+          fi
+          if [ "${rejected}" -ne 0 ] || [ "${status}" -ne 0 ]; then
+            exit 1
+          fi
