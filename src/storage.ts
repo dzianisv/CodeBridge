@@ -49,6 +49,7 @@ export type RunStore = {
   updateSessionLinkStatus: (input: UpdateSessionLinkStatusInput) => Promise<SessionLink>
   getJiraPollState: (tenantId: string) => Promise<{ lastCursor: string; updatedAt: string } | null>
   updateJiraPollState: (input: { tenantId: string; lastCursor: string }) => Promise<void>
+  checkWritable: () => Promise<void>
   close?: () => Promise<void>
 }
 
@@ -196,6 +197,18 @@ export function createPostgresStore(databaseUrl: string): RunStore {
     )
   }
 
+  const checkWritable = async () => {
+    await pool.query(
+      `INSERT INTO github_poll_state (tenant_id, repo_full_name, last_comment_id, last_comment_created_at)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (tenant_id, repo_full_name)
+       DO UPDATE SET last_comment_id = EXCLUDED.last_comment_id,
+                     last_comment_created_at = EXCLUDED.last_comment_created_at,
+                     updated_at = now()`,
+      ["__health__", "__health__", null, new Date().toISOString()]
+    )
+  }
+
   const harness = createHarnessStorage(createPostgresSql(pool), "pg")
   const close = async () => {
     await pool.end()
@@ -215,6 +228,7 @@ export function createPostgresStore(databaseUrl: string): RunStore {
     updateRunBranch,
     updateRunPr,
     appendEvent,
+    checkWritable,
     close,
     ...harness
   }
@@ -431,6 +445,10 @@ export function createSqliteStore(databaseUrl: string): RunStore {
     insertEventStmt.run(event.runId, event.seq, event.type, JSON.stringify(event.payload))
   }
 
+  const checkWritable = async () => {
+    upsertPollStateStmt.run("__health__", "__health__", null, new Date().toISOString())
+  }
+
   const harness = createHarnessStorage(createSqliteSql(db), "sqlite", true)
   const close = async () => {
     db.close()
@@ -450,6 +468,7 @@ export function createSqliteStore(databaseUrl: string): RunStore {
     updateRunBranch,
     updateRunPr,
     appendEvent,
+    checkWritable,
     close,
     ...harness
   }

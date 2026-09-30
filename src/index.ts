@@ -8,7 +8,8 @@ import { createRunner } from "./runner.js"
 import { startSlack } from "./slack.js"
 import { createGitHubApp } from "./github.js"
 import { resolveRepo, ensureRepoPath } from "./repo.js"
-import { logger } from "./logger.js"
+import { logger, getLoggerHealth } from "./logger.js"
+import { createHealthHandler } from "./health.js"
 import { getAssigneeValidationHealth, startGitHubPolling } from "./github-poll.js"
 import { createHarnessBackedJiraPoller, startJiraPolling } from "./jira-poll.js"
 import { createCodexNotifyHandler } from "./codex-notify.js"
@@ -58,12 +59,9 @@ const main = async () => {
     const app = express()
     app.use(express.json({ limit: "1mb" }))
 
-    app.get("/health", (_req, res) => {
-      res.json({
-        status: "ok",
-        assigneeValidation: getAssigneeValidationHealth()
-      })
-    })
+    app.get("/health", createHealthHandler(store, getLoggerHealth, () => ({
+      assigneeValidation: getAssigneeValidationHealth()
+    })))
     app.post("/codex/notify", createCodexNotifyHandler({
       config,
       githubAppId: secrets.githubAppId,
