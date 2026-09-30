@@ -731,6 +731,9 @@ function fakeClient(issues: Array<ReturnType<typeof openIssue>>): any {
   return {
     octokit: {
       issues: {
+        // Main validates assignees before listForRepo. These fakes are the
+        // configured operator, so the check is a 204 and polling continues.
+        checkUserCanBeAssigned: async () => ({ status: 204 }),
         listForRepo: async () => ({ data: issues })
       }
     }
@@ -741,6 +744,7 @@ function fakePrClient(number: number, body: string): any {
   return {
     octokit: {
       issues: {
+        checkUserCanBeAssigned: async () => ({ status: 204 }),
         listForRepo: async () => ({
           data: [{ number, pull_request: { url: "x" }, title: "PR" }]
         })

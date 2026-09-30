@@ -1032,6 +1032,22 @@ export async function pollValidatedAssignmentForTests(input: {
           throw new Error("issue assignment poll reached run service")
         }
       } as unknown as RunService,
+      harness: {
+        store: {
+          getRunBySourceKey: async () => {
+            throw new Error("issue assignment poll reached harness")
+          }
+        } as unknown as RunStore,
+        config: { tenants: [input.tenant] },
+        sessions: {
+          createSession: async () => {
+            throw new Error("issue assignment poll reached harness")
+          },
+          appendTurn: async () => {
+            throw new Error("issue assignment poll reached harness")
+          }
+        }
+      },
       appIdentityPromise
     })
     return
